@@ -63,3 +63,31 @@ See `.env.example`.
 - replace raw video upload/processing with a backend-managed media pipeline
 - move more admin-sensitive writes behind backend APIs
 - add Garage object deletion endpoints for media lifecycle cleanup
+
+## Firebase reset script
+
+The backend includes a guarded backup/reset script that:
+- backs up all top-level Firestore collections to local JSON
+- backs up Firebase Auth users to local JSON
+- preserves admin user accounts from the `users` collection
+- optionally inventories or deletes Firebase Storage objects
+
+Commands:
+
+```bash
+npm run firebase:backup
+npm run firebase:reset
+npm run firebase:reset-storage
+npm run firebase:backup-all
+npm run firebase:reset-all
+```
+
+Notes:
+- `firebase:backup` only writes backups and does not delete anything.
+- `firebase:reset` deletes Firestore and Auth data except admin accounts.
+- `firebase:reset-storage` also deletes Firebase Storage objects and requires `FIREBASE_STORAGE_BUCKET`.
+- `firebase:backup-all` also writes Firebase Storage, Garage, and Cloudinary manifests.
+- `firebase:reset-all` deletes Firestore/Auth except admin accounts and also deletes Firebase Storage, Garage objects, and Cloudinary assets.
+- backups are written under `backend/backups/firebase-reset-<timestamp>/` by default.
+- use `--download-storage` with `tsx src/scripts/reset-firebase.ts` only if you intentionally want local copies of every Firebase Storage object.
+- `firebase:reset-all` requires `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` if old Cloudinary assets should be deleted too.

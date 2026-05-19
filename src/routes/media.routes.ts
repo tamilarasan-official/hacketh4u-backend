@@ -1,7 +1,12 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
-import { completeUpload, createSignedUpload, deleteObject } from "../services/media.service";
+import {
+  completeUpload,
+  createSignedUpload,
+  deleteObject,
+  uploadObjectDirect
+} from "../services/media.service";
 
 const uploadRequestSchema = z.object({
   fileName: z.string().min(1),
@@ -30,6 +35,55 @@ const deleteObjectSchema = z.object({
 });
 
 export const mediaRouter = Router();
+
+mediaRouter.post(
+  "/upload",
+  requireAuth,
+  express.raw({
+    type: "*/*",
+    limit: "1024mb"
+  }),
+  async (req, res, next) => {
+    try {
+      const fileName = req.header("x-file-name")?.trim() ?? "";
+      const contentType = req.header("content-type")?.trim() ?? "";
+      const folder = req.header("x-folder")?.trim() ?? "";
+      const entityType = req.header("x-entity-type")?.trim() ?? "";
+      const entityId = req.header("x-entity-id")?.trim() ?? "";
+
+      const payload = uploadRequestSchema.parse({
+        fileName,
+        contentType,
+        folder
+      });
+
+      if (!entityType || !entityId) {
+        throw new z.ZodError([
+          {
+            code: "custom",
+            path: ["entityType"],
+            message: "entityType and entityId are required."
+          }
+        ]);
+      }
+
+      const fileBuffer = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(req.body ?? []);
+
+      const result = await uploadObjectDirect({
+        userId: req.authUser!.uid,
+        fileBuffer,
+        entityType,
+        entityId,
+        ...payload
+      });
+      res.status(201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 mediaRouter.post("/upload-url", requireAuth, async (req, res, next) => {
   try {

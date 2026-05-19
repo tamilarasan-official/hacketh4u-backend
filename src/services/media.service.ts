@@ -2,7 +2,7 @@ import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { firestore } from "../config/firebase";
 import { env } from "../config/env";
-import { garageS3 } from "../config/garage";
+import { garageS3, garageSigningRegion } from "../config/garage";
 import { HttpError } from "../utils/http-error";
 
 type UploadFolder =
@@ -21,13 +21,23 @@ type RequestUploadInput = {
   folder: UploadFolder;
 };
 
+type DirectUploadInput = RequestUploadInput & {
+  entityType: string;
+  entityId: string;
+  fileBuffer: Buffer;
+};
+
+function buildObjectKey(input: RequestUploadInput): string {
+  const safeFileName = input.fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return `${input.folder}/${input.userId}/${Date.now()}_${safeFileName}`;
+}
+
 export async function createSignedUpload(input: RequestUploadInput): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
   }
 
-  const safeFileName = input.fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const objectKey = `${input.folder}/${input.userId}/${Date.now()}_${safeFileName}`;
+  const objectKey = buildObjectKey(input);
 
   const command = new PutObjectCommand({
     Bucket: env.GARAGE_S3_BUCKET,
@@ -35,13 +45,59 @@ export async function createSignedUpload(input: RequestUploadInput): Promise<Rec
     ContentType: input.contentType
   });
 
-  const uploadUrl = await getSignedUrl(garageS3, command, { expiresIn: 900 });
+  const uploadUrl = await getSignedUrl(garageS3, command, {
+    expiresIn: 900,
+    signingRegion: garageSigningRegion
+  });
 
   return {
     bucket: env.GARAGE_S3_BUCKET,
     objectKey,
     uploadUrl,
     publicUrl: `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`
+  };
+}
+
+export async function uploadObjectDirect(input: DirectUploadInput): Promise<Record<string, unknown>> {
+  if (!input.fileName.trim()) {
+    throw new HttpError(400, "fileName is required.");
+  }
+
+  if (!input.fileBuffer.length) {
+    throw new HttpError(400, "File body is empty.");
+  }
+
+  const objectKey = buildObjectKey(input);
+  const publicUrl = `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`;
+
+  await garageS3.send(
+    new PutObjectCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: objectKey,
+      ContentType: input.contentType,
+      Body: input.fileBuffer
+    })
+  );
+
+  const record = {
+    userId: input.userId,
+    objectKey,
+    publicUrl,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    contentType: input.contentType,
+    status: "uploaded",
+    storageProvider: "garage-s3",
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  const docRef = await firestore.collection("media_uploads").add(record);
+
+  return {
+    id: docRef.id,
+    objectKey,
+    publicUrl
   };
 }
 

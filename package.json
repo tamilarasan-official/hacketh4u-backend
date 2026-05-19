@@ -8,7 +8,12 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "firebase:backup": "tsx src/scripts/reset-firebase.ts",
+    "firebase:reset": "tsx src/scripts/reset-firebase.ts --execute",
+    "firebase:backup-all": "tsx src/scripts/reset-firebase.ts --include-storage --include-garage --include-cloudinary",
+    "firebase:reset-storage": "tsx src/scripts/reset-firebase.ts --execute --include-storage",
+    "firebase:reset-all": "tsx src/scripts/reset-firebase.ts --execute --include-storage --include-garage --include-cloudinary"
   },
   "engines": {
     "node": ">=20"
@@ -16,6 +21,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.840.0",
     "@aws-sdk/s3-request-presigner": "^3.840.0",
+    "cloudinary": "^2.7.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
