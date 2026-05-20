@@ -1,4 +1,4 @@
-import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { firestore } from "../config/firebase";
 import { env } from "../config/env";
@@ -32,6 +32,14 @@ function buildObjectKey(input: RequestUploadInput): string {
   return `${input.folder}/${input.userId}/${Date.now()}_${safeFileName}`;
 }
 
+function buildPublicMediaUrl(objectKey: string): string {
+  const baseUrl = (env.APP_BASE_URL || "").replace(/\/$/, "");
+  if (baseUrl) {
+    return `${baseUrl}/media/public/${objectKey}`;
+  }
+  return `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${env.GARAGE_S3_BUCKET}/${objectKey}`;
+}
+
 export async function createSignedUpload(input: RequestUploadInput): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
@@ -54,7 +62,7 @@ export async function createSignedUpload(input: RequestUploadInput): Promise<Rec
     bucket: env.GARAGE_S3_BUCKET,
     objectKey,
     uploadUrl,
-    publicUrl: `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`
+    publicUrl: buildPublicMediaUrl(objectKey)
   };
 }
 
@@ -68,7 +76,7 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
   }
 
   const objectKey = buildObjectKey(input);
-  const publicUrl = `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`;
+  const publicUrl = buildPublicMediaUrl(objectKey);
 
   await garageS3.send(
     new PutObjectCommand({
@@ -99,6 +107,19 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
     objectKey,
     publicUrl
   };
+}
+
+export async function getObject(objectKey: string) {
+  if (!objectKey.trim()) {
+    throw new HttpError(400, "objectKey is required.");
+  }
+
+  return garageS3.send(
+    new GetObjectCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: objectKey
+    })
+  );
 }
 
 type CompleteUploadInput = {

@@ -5,6 +5,7 @@ import {
   completeUpload,
   createSignedUpload,
   deleteObject,
+  getObject,
   uploadObjectDirect
 } from "../services/media.service";
 
@@ -35,6 +36,36 @@ const deleteObjectSchema = z.object({
 });
 
 export const mediaRouter = Router();
+
+mediaRouter.get("/public/*", async (req, res, next) => {
+  try {
+    const wildcardParams = req.params as Record<string, string | string[] | undefined>;
+    const rawObjectKey = wildcardParams["0"] ?? wildcardParams[""];
+    const objectKey = decodeURIComponent(
+      Array.isArray(rawObjectKey) ? rawObjectKey[0] ?? "" : rawObjectKey ?? ""
+    );
+    const result = await getObject(objectKey);
+
+    if (result.ContentType) {
+      res.setHeader("Content-Type", result.ContentType);
+    }
+    if (result.ContentLength != null) {
+      res.setHeader("Content-Length", result.ContentLength.toString());
+    }
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
+    const body = result.Body as NodeJS.ReadableStream | undefined;
+    if (!body) {
+      res.status(404).json({ error: "Object not found." });
+      return;
+    }
+
+    body.on("error", next);
+    body.pipe(res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 mediaRouter.post(
   "/upload",
