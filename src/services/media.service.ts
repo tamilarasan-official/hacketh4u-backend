@@ -1,5 +1,6 @@
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import type { Readable } from "node:stream";
 import { firestore } from "../config/firebase";
 import { env } from "../config/env";
 import { garageS3, garageSigningRegion } from "../config/garage";
@@ -24,7 +25,8 @@ type RequestUploadInput = {
 type DirectUploadInput = RequestUploadInput & {
   entityType: string;
   entityId: string;
-  fileBuffer: Buffer;
+  fileStream: Readable;
+  fileSize?: number;
 };
 
 function buildObjectKey(input: RequestUploadInput): string {
@@ -71,7 +73,7 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
     throw new HttpError(400, "fileName is required.");
   }
 
-  if (!input.fileBuffer.length) {
+  if (input.fileSize != null && input.fileSize <= 0) {
     throw new HttpError(400, "File body is empty.");
   }
 
@@ -83,7 +85,8 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
       Bucket: env.GARAGE_S3_BUCKET,
       Key: objectKey,
       ContentType: input.contentType,
-      Body: input.fileBuffer
+      Body: input.fileStream,
+      ...(input.fileSize != null ? { ContentLength: input.fileSize } : {})
     })
   );
 

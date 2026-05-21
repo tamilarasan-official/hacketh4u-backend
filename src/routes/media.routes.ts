@@ -1,4 +1,5 @@
 import express, { Router } from "express";
+import type { Readable } from "node:stream";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import {
@@ -70,10 +71,6 @@ mediaRouter.get("/public/*", async (req, res, next) => {
 mediaRouter.post(
   "/upload",
   requireAuth,
-  express.raw({
-    type: "*/*",
-    limit: "1024mb"
-  }),
   async (req, res, next) => {
     try {
       const fileName = req.header("x-file-name")?.trim() ?? "";
@@ -81,6 +78,8 @@ mediaRouter.post(
       const folder = req.header("x-folder")?.trim() ?? "";
       const entityType = req.header("x-entity-type")?.trim() ?? "";
       const entityId = req.header("x-entity-id")?.trim() ?? "";
+      const fileSizeHeader = req.header("x-file-size")?.trim();
+      const fileSize = fileSizeHeader ? Number(fileSizeHeader) : undefined;
 
       const payload = uploadRequestSchema.parse({
         fileName,
@@ -98,13 +97,10 @@ mediaRouter.post(
         ]);
       }
 
-      const fileBuffer = Buffer.isBuffer(req.body)
-        ? req.body
-        : Buffer.from(req.body ?? []);
-
       const result = await uploadObjectDirect({
         userId: req.authUser!.uid,
-        fileBuffer,
+        fileStream: req as unknown as Readable,
+        fileSize: Number.isFinite(fileSize) ? fileSize : undefined,
         entityType,
         entityId,
         ...payload
