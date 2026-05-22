@@ -1,4 +1,5 @@
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Readable } from "node:stream";
 import { firestore } from "../config/firebase";
@@ -79,16 +80,45 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
 
   const objectKey = buildObjectKey(input);
   const publicUrl = buildPublicMediaUrl(objectKey);
+  console.info("Starting Garage upload", {
+    objectKey,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    fileSize: input.fileSize ?? null,
+    contentType: input.contentType
+  });
 
-  await garageS3.send(
-    new PutObjectCommand({
+  const upload = new Upload({
+    client: garageS3,
+    params: {
       Bucket: env.GARAGE_S3_BUCKET,
       Key: objectKey,
       ContentType: input.contentType,
       Body: input.fileStream,
       ...(input.fileSize != null ? { ContentLength: input.fileSize } : {})
-    })
-  );
+    },
+    queueSize: 1,
+    partSize: 8 * 1024 * 1024,
+    leavePartsOnError: false
+  });
+
+  try {
+    await upload.done();
+  } catch (error) {
+    console.error("Garage upload failed", {
+      objectKey,
+      entityType: input.entityType,
+      entityId: input.entityId,
+      message: error instanceof Error ? error.message : String(error)
+    });
+    throw error;
+  }
+
+  console.info("Garage upload completed", {
+    objectKey,
+    entityType: input.entityType,
+    entityId: input.entityId
+  });
 
   const record = {
     userId: input.userId,
