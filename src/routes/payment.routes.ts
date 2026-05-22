@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import {
+  completeFreePurchase,
   createPaymentOrder,
   getPaymentByInternalId,
   handleRazorpayWebhook,
@@ -43,12 +44,52 @@ const verifyClientPaymentSchema = z.object({
   razorpaySignature: z.string().min(1)
 });
 
+const completeFreePurchaseSchema = z.object({
+  paymentId: z.string().min(1).optional(),
+  userEmail: z.string().email(),
+  userName: z.string().min(1),
+  userPhone: z.string().min(1),
+  currency: z.string().default("INR"),
+  totalAmount: z.number().nonnegative().optional(),
+  discountAmount: z.number().nonnegative().optional(),
+  gstAmount: z.number().nonnegative().optional(),
+  finalAmount: z.number().min(0).max(0),
+  couponCode: z.string().nullable().optional(),
+  couponId: z.string().nullable().optional(),
+  courses: z
+    .array(
+      z.object({
+        courseId: z.string().min(1),
+        courseTitle: z.string().min(1),
+        instructorName: z.string().min(1),
+        thumbnailUrl: z.string().optional(),
+        price: z.number().nonnegative(),
+        originalPrice: z.number().nonnegative().optional(),
+        subscriptionPeriod: z.number().int().nonnegative().optional()
+      })
+    )
+    .min(1)
+});
+
 export const paymentRouter = Router();
 
 paymentRouter.post("/create-order", requireAuth, async (req, res, next) => {
   try {
     const payload = createOrderSchema.parse(req.body);
     const result = await createPaymentOrder({
+      ...payload,
+      userId: req.authUser!.uid
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+paymentRouter.post("/complete-free-purchase", requireAuth, async (req, res, next) => {
+  try {
+    const payload = completeFreePurchaseSchema.parse(req.body);
+    const result = await completeFreePurchase({
       ...payload,
       userId: req.authUser!.uid
     });

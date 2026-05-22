@@ -29,6 +29,22 @@ type CreateOrderInput = {
   totalAmount?: number;
 };
 
+type CompleteFreePurchaseInput = {
+  paymentId?: string;
+  userId: string;
+  userEmail: string;
+  userName: string;
+  userPhone: string;
+  currency?: string;
+  courses: PaymentCourse[];
+  couponCode?: string | null;
+  couponId?: string | null;
+  discountAmount?: number;
+  gstAmount?: number;
+  totalAmount?: number;
+  finalAmount?: number;
+};
+
 type PaymentCourse = CreateOrderInput["courses"][number];
 
 function buildEntitlementFromCourse(
@@ -104,6 +120,15 @@ async function applyFailedPayment(
   });
 }
 
+function buildInternalPaymentId(explicitPaymentId?: string): string {
+  return (
+    explicitPaymentId?.trim() ||
+    `pay_${Date.now()}_${Math.floor(Math.random() * 10000)
+      .toString()
+      .padStart(4, "0")}`
+  );
+}
+
 export async function createPaymentOrder(input: CreateOrderInput): Promise<Record<string, unknown>> {
   if (!input.courses.length) {
     throw new HttpError(400, "At least one course is required for payment.");
@@ -113,11 +138,7 @@ export async function createPaymentOrder(input: CreateOrderInput): Promise<Recor
     throw new HttpError(400, "Amount must be a positive number in paise.");
   }
 
-  const internalPaymentId =
-    input.paymentId?.trim() ||
-    `pay_${Date.now()}_${Math.floor(Math.random() * 10000)
-      .toString()
-      .padStart(4, "0")}`;
+  const internalPaymentId = buildInternalPaymentId(input.paymentId);
 
   const razorpayOrder = await razorpay.orders.create({
     amount: input.amount,
@@ -159,6 +180,52 @@ export async function createPaymentOrder(input: CreateOrderInput): Promise<Recor
     keyId: env.RAZORPAY_KEY_ID,
     amount: razorpayOrder.amount,
     currency: razorpayOrder.currency
+  };
+}
+
+export async function completeFreePurchase(
+  input: CompleteFreePurchaseInput
+): Promise<Record<string, unknown>> {
+  if (!input.courses.length) {
+    throw new HttpError(400, "At least one course is required for purchase.");
+  }
+
+  if ((input.finalAmount ?? 0) < 0 || (input.finalAmount ?? 0) > 0) {
+    throw new HttpError(400, "Free purchase flow only supports zero-value checkouts.");
+  }
+
+  const internalPaymentId = buildInternalPaymentId(input.paymentId);
+
+  const paymentRecord = {
+    paymentId: internalPaymentId,
+    razorpayOrderId: null,
+    userId: input.userId,
+    userEmail: input.userEmail,
+    userName: input.userName,
+    userPhone: input.userPhone,
+    courses: input.courses,
+    totalAmount: input.totalAmount ?? 0,
+    discountAmount: input.discountAmount ?? 0,
+    gstAmount: input.gstAmount ?? 0,
+    finalAmount: input.finalAmount ?? 0,
+    couponCode: input.couponCode ?? null,
+    couponId: input.couponId ?? null,
+    paymentStatus: "pending",
+    paymentMethod: input.couponCode ? "coupon" : "free",
+    currency: input.currency ?? "INR",
+    paymentDate: new Date(),
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp()
+  };
+
+  const docRef = await firestore.collection("payments").add(paymentRecord);
+  await applyCompletedPayment(docRef.id, paymentRecord, null);
+
+  return {
+    paymentDocId: docRef.id,
+    paymentId: internalPaymentId,
+    status: "completed",
+    paymentMethod: paymentRecord.paymentMethod
   };
 }
 
