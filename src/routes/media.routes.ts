@@ -10,6 +10,7 @@ import {
   getObject,
   uploadObjectDirect
 } from "../services/media.service";
+import { HttpError } from "../utils/http-error";
 
 const uploadRequestSchema = z.object({
   fileName: z.string().min(1),
@@ -75,6 +76,9 @@ mediaRouter.post(
   async (req, res, next) => {
     try {
       const contentTypeHeader = req.header("content-type") ?? "";
+      const fileSizeHeader = req.header("x-file-size")?.trim();
+      const fileSize = fileSizeHeader ? Number(fileSizeHeader) : undefined;
+
       if (contentTypeHeader.toLowerCase().includes("multipart/form-data")) {
         const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
           const busboy = Busboy({
@@ -85,15 +89,55 @@ mediaRouter.post(
             }
           });
 
-          let fileName = "";
-          let folder = "";
-          let entityType = "";
-          let entityId = "";
-          let declaredContentType = "";
+          let fileName = req.header("x-file-name")?.trim() ?? "";
+          let folder = req.header("x-folder")?.trim() ?? "";
+          let entityType = req.header("x-entity-type")?.trim() ?? "";
+          let entityId = req.header("x-entity-id")?.trim() ?? "";
+          let declaredContentType = req.header("x-upload-content-type")?.trim() ?? "";
           let fileStream: Readable | null = null;
           let uploadMimeType = "";
-          let uploadCompleted = false;
+          let fileReceived = false;
+          let parserFinished = false;
+          let settled = false;
           let uploadPromise: Promise<Record<string, unknown>> | null = null;
+          let uploadResult: Record<string, unknown> | null = null;
+
+          const cleanup = () => {
+            req.off("aborted", handleAbort);
+            busboy.off("error", safeReject);
+          };
+
+          const safeResolve = (value: Record<string, unknown>) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            cleanup();
+            resolve(value);
+          };
+
+          const safeReject = (error: unknown) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            cleanup();
+            reject(error);
+          };
+
+          const maybeResolve = () => {
+            if (parserFinished && uploadResult) {
+              safeResolve(uploadResult);
+            }
+          };
+
+          const handleAbort = () => {
+            const abortError = new HttpError(499, "Upload was interrupted by the client.");
+            if (fileStream && !fileStream.destroyed) {
+              fileStream.destroy(abortError);
+            }
+            safeReject(abortError);
+          };
 
           busboy.on("field", (fieldName, value) => {
             switch (fieldName) {
@@ -123,10 +167,18 @@ mediaRouter.post(
               return;
             }
 
+            if (fileReceived) {
+              stream.resume();
+              safeReject(new Error("Only a single file is supported per upload."));
+              return;
+            }
+
+            fileReceived = true;
             fileStream = stream as unknown as Readable;
             uploadMimeType = info.mimeType;
-            stream.on("limit", () => {
-              reject(new Error("Uploaded file exceeds the maximum supported size."));
+            stream.once("error", safeReject);
+            stream.once("limit", () => {
+              safeReject(new Error("Uploaded file exceeds the maximum supported size."));
             });
 
             uploadPromise = (async () => {
@@ -149,32 +201,31 @@ mediaRouter.post(
               return uploadObjectDirect({
                 userId: req.authUser!.uid,
                 fileStream: fileStream as Readable,
+                fileSize: Number.isFinite(fileSize) ? fileSize : undefined,
                 entityType,
                 entityId,
                 ...payload
               });
             })();
+
+            uploadPromise
+              .then((result) => {
+                uploadResult = result;
+                maybeResolve();
+              })
+              .catch(safeReject);
           });
 
-          busboy.once("error", reject);
-          req.once("aborted", () => reject(new Error("Upload was interrupted by the client.")));
+          busboy.once("error", safeReject);
+          req.once("aborted", handleAbort);
 
-          busboy.on("finish", async () => {
-            try {
-              if (uploadCompleted) {
-                return;
-              }
-              uploadCompleted = true;
-
-              if (!uploadPromise) {
-                throw new Error("No file was received in the upload request.");
-              }
-
-              const uploadResult = await uploadPromise;
-              resolve(uploadResult);
-            } catch (error) {
-              reject(error);
+          busboy.on("finish", () => {
+            parserFinished = true;
+            if (!uploadPromise || !fileReceived) {
+              safeReject(new Error("No file was received in the upload request."));
+              return;
             }
+            maybeResolve();
           });
 
           req.pipe(busboy);
@@ -189,8 +240,6 @@ mediaRouter.post(
       const folder = req.header("x-folder")?.trim() ?? "";
       const entityType = req.header("x-entity-type")?.trim() ?? "";
       const entityId = req.header("x-entity-id")?.trim() ?? "";
-      const fileSizeHeader = req.header("x-file-size")?.trim();
-      const fileSize = fileSizeHeader ? Number(fileSizeHeader) : undefined;
 
       const payload = uploadRequestSchema.parse({
         fileName,
