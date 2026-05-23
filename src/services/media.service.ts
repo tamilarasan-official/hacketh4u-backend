@@ -339,7 +339,7 @@ export async function abortMultipartUpload(input: MultipartUploadAbortInput): Pr
   );
 }
 
-export async function getObject(objectKey: string) {
+export async function getObject(objectKey: string, range?: string) {
   if (!objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -347,7 +347,8 @@ export async function getObject(objectKey: string) {
   return garageS3.send(
     new GetObjectCommand({
       Bucket: env.GARAGE_S3_BUCKET,
-      Key: objectKey
+      Key: objectKey,
+      ...(range ? { Range: range } : {})
     })
   );
 }

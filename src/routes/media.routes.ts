@@ -79,13 +79,25 @@ mediaRouter.get("/public/*", async (req, res, next) => {
     const objectKey = decodeURIComponent(
       Array.isArray(rawObjectKey) ? rawObjectKey[0] ?? "" : rawObjectKey ?? ""
     );
-    const result = await getObject(objectKey);
+    const rangeHeader = req.header("range")?.trim();
+    const result = await getObject(objectKey, rangeHeader);
 
     if (result.ContentType) {
       res.setHeader("Content-Type", result.ContentType);
     }
+    res.setHeader("Accept-Ranges", "bytes");
     if (result.ContentLength != null) {
       res.setHeader("Content-Length", result.ContentLength.toString());
+    }
+    if (rangeHeader && result.ContentRange) {
+      res.status(206);
+      res.setHeader("Content-Range", result.ContentRange);
+    }
+    if (result.ETag) {
+      res.setHeader("ETag", result.ETag);
+    }
+    if (result.LastModified) {
+      res.setHeader("Last-Modified", result.LastModified.toUTCString());
     }
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
 
