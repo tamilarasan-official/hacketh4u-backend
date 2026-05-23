@@ -4,10 +4,14 @@ import type { Readable } from "node:stream";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import {
+  abortMultipartUpload,
   completeUpload,
+  completeMultipartUpload,
   createSignedUpload,
   deleteObject,
   getObject,
+  initiateMultipartUpload,
+  uploadMultipartPart,
   uploadObjectDirect
 } from "../services/media.service";
 import { HttpError } from "../utils/http-error";
@@ -35,6 +39,34 @@ const completeUploadSchema = z.object({
 });
 
 const deleteObjectSchema = z.object({
+  objectKey: z.string().min(1)
+});
+
+const multipartInitSchema = uploadRequestSchema.extend({
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  fileSize: z.number().positive().optional()
+});
+
+const multipartCompleteSchema = z.object({
+  uploadId: z.string().min(1),
+  objectKey: z.string().min(1),
+  publicUrl: z.string().url(),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  contentType: z.string().min(1),
+  parts: z
+    .array(
+      z.object({
+        partNumber: z.number().int().positive(),
+        eTag: z.string().min(1)
+      })
+    )
+    .min(1)
+});
+
+const multipartAbortSchema = z.object({
+  uploadId: z.string().min(1),
   objectKey: z.string().min(1)
 });
 
@@ -280,6 +312,71 @@ mediaRouter.post("/upload-url", requireAuth, async (req, res, next) => {
       ...payload
     });
     res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+mediaRouter.post("/multipart/initiate", requireAuth, async (req, res, next) => {
+  try {
+    const payload = multipartInitSchema.parse(req.body);
+    const result = await initiateMultipartUpload({
+      userId: req.authUser!.uid,
+      ...payload
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+mediaRouter.post(
+  "/multipart/part",
+  requireAuth,
+  express.raw({
+    type: "*/*",
+    limit: "16mb"
+  }),
+  async (req, res, next) => {
+    try {
+      const uploadId = req.header("x-upload-id")?.trim() ?? "";
+      const objectKey = req.header("x-object-key")?.trim() ?? "";
+      const partNumberHeader = req.header("x-part-number")?.trim() ?? "";
+      const partNumber = Number(partNumberHeader);
+      const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
+
+      const result = await uploadMultipartPart({
+        uploadId,
+        objectKey,
+        partNumber,
+        body
+      });
+
+      res.status(201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+mediaRouter.post("/multipart/complete", requireAuth, async (req, res, next) => {
+  try {
+    const payload = multipartCompleteSchema.parse(req.body);
+    const result = await completeMultipartUpload({
+      userId: req.authUser!.uid,
+      ...payload
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+mediaRouter.post("/multipart/abort", requireAuth, async (req, res, next) => {
+  try {
+    const payload = multipartAbortSchema.parse(req.body);
+    await abortMultipartUpload(payload);
+    res.json({ aborted: true });
   } catch (error) {
     next(error);
   }

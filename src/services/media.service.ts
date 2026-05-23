@@ -1,4 +1,12 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+  UploadPartCommand
+} from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Readable } from "node:stream";
@@ -28,6 +36,38 @@ type DirectUploadInput = RequestUploadInput & {
   entityId: string;
   fileStream: Readable;
   fileSize?: number;
+};
+
+type MultipartUploadInitInput = RequestUploadInput & {
+  entityType: string;
+  entityId: string;
+  fileSize?: number;
+};
+
+type MultipartUploadPartInput = {
+  objectKey: string;
+  uploadId: string;
+  partNumber: number;
+  body: Buffer;
+};
+
+type MultipartUploadCompleteInput = {
+  userId: string;
+  objectKey: string;
+  uploadId: string;
+  publicUrl: string;
+  entityType: string;
+  entityId: string;
+  contentType: string;
+  parts: Array<{
+    partNumber: number;
+    eTag: string;
+  }>;
+};
+
+type MultipartUploadAbortInput = {
+  objectKey: string;
+  uploadId: string;
 };
 
 function buildObjectKey(input: RequestUploadInput): string {
@@ -140,6 +180,163 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
     objectKey,
     publicUrl
   };
+}
+
+export async function initiateMultipartUpload(
+  input: MultipartUploadInitInput
+): Promise<Record<string, unknown>> {
+  if (!input.fileName.trim()) {
+    throw new HttpError(400, "fileName is required.");
+  }
+
+  if (input.fileSize != null && input.fileSize <= 0) {
+    throw new HttpError(400, "File body is empty.");
+  }
+
+  const objectKey = buildObjectKey(input);
+  const publicUrl = buildPublicMediaUrl(objectKey);
+
+  const result = await garageS3.send(
+    new CreateMultipartUploadCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: objectKey,
+      ContentType: input.contentType
+    })
+  );
+
+  if (!result.UploadId) {
+    throw new HttpError(500, "Failed to initialize multipart upload.");
+  }
+
+  console.info("Initialized Garage multipart upload", {
+    objectKey,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    fileSize: input.fileSize ?? null,
+    contentType: input.contentType
+  });
+
+  return {
+    uploadId: result.UploadId,
+    objectKey,
+    publicUrl
+  };
+}
+
+export async function uploadMultipartPart(
+  input: MultipartUploadPartInput
+): Promise<Record<string, unknown>> {
+  if (!input.objectKey.trim()) {
+    throw new HttpError(400, "objectKey is required.");
+  }
+
+  if (!input.uploadId.trim()) {
+    throw new HttpError(400, "uploadId is required.");
+  }
+
+  if (!Number.isInteger(input.partNumber) || input.partNumber < 1) {
+    throw new HttpError(400, "partNumber must be a positive integer.");
+  }
+
+  if (input.body.length === 0) {
+    throw new HttpError(400, "Chunk body is empty.");
+  }
+
+  const result = await garageS3.send(
+    new UploadPartCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: input.objectKey,
+      UploadId: input.uploadId,
+      PartNumber: input.partNumber,
+      Body: input.body,
+      ContentLength: input.body.length
+    })
+  );
+
+  if (!result.ETag) {
+    throw new HttpError(500, "Failed to upload multipart chunk.");
+  }
+
+  return {
+    partNumber: input.partNumber,
+    eTag: result.ETag
+  };
+}
+
+export async function completeMultipartUpload(
+  input: MultipartUploadCompleteInput
+): Promise<Record<string, unknown>> {
+  if (!input.objectKey.trim()) {
+    throw new HttpError(400, "objectKey is required.");
+  }
+
+  if (!input.uploadId.trim()) {
+    throw new HttpError(400, "uploadId is required.");
+  }
+
+  if (!input.parts.length) {
+    throw new HttpError(400, "At least one uploaded part is required.");
+  }
+
+  const sortedParts = [...input.parts]
+    .sort((a, b) => a.partNumber - b.partNumber)
+    .map((part) => ({
+      ETag: part.eTag,
+      PartNumber: part.partNumber
+    }));
+
+  await garageS3.send(
+    new CompleteMultipartUploadCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: input.objectKey,
+      UploadId: input.uploadId,
+      MultipartUpload: {
+        Parts: sortedParts
+      }
+    })
+  );
+
+  console.info("Garage multipart upload completed", {
+    objectKey: input.objectKey,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    parts: sortedParts.length
+  });
+
+  const record = {
+    userId: input.userId,
+    objectKey: input.objectKey,
+    publicUrl: input.publicUrl,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    contentType: input.contentType,
+    status: "uploaded",
+    storageProvider: "garage-s3",
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  const docRef = await firestore.collection("media_uploads").add(record);
+
+  return {
+    id: docRef.id,
+    objectKey: input.objectKey,
+    publicUrl: input.publicUrl
+  };
+}
+
+export async function abortMultipartUpload(input: MultipartUploadAbortInput): Promise<void> {
+  if (!input.objectKey.trim() || !input.uploadId.trim()) {
+    return;
+  }
+
+  await garageS3.send(
+    new AbortMultipartUploadCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: input.objectKey,
+      UploadId: input.uploadId
+    })
+  );
 }
 
 export async function getObject(objectKey: string) {
