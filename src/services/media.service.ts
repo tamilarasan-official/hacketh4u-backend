@@ -4,6 +4,7 @@ import {
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   UploadPartCommand
 } from "@aws-sdk/client-s3";
@@ -349,6 +350,19 @@ export async function getObject(objectKey: string, range?: string) {
       Bucket: env.GARAGE_S3_BUCKET,
       Key: objectKey,
       ...(range ? { Range: range } : {})
+    })
+  );
+}
+
+export async function headObject(objectKey: string) {
+  if (!objectKey.trim()) {
+    throw new HttpError(400, "objectKey is required.");
+  }
+
+  return garageS3.send(
+    new HeadObjectCommand({
+      Bucket: env.GARAGE_S3_BUCKET,
+      Key: objectKey
     })
   );
 }

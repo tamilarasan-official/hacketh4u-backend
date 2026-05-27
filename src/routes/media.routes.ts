@@ -10,6 +10,7 @@ import {
   createSignedUpload,
   deleteObject,
   getObject,
+  headObject,
   initiateMultipartUpload,
   uploadMultipartPart,
   uploadObjectDirect
@@ -72,34 +73,62 @@ const multipartAbortSchema = z.object({
 
 export const mediaRouter = Router();
 
+const getPublicObjectKey = (req: express.Request): string => {
+  const wildcardParams = req.params as Record<string, string | string[] | undefined>;
+  const rawObjectKey = wildcardParams["0"] ?? wildcardParams[""];
+  return decodeURIComponent(
+    Array.isArray(rawObjectKey) ? rawObjectKey[0] ?? "" : rawObjectKey ?? ""
+  );
+};
+
+const setMediaHeaders = (
+  res: express.Response,
+  result: {
+    ContentType?: string;
+    ContentLength?: number;
+    ContentRange?: string;
+    ETag?: string;
+    LastModified?: Date;
+  },
+  options: { partial?: boolean } = {}
+) => {
+  if (result.ContentType) {
+    res.setHeader("Content-Type", result.ContentType);
+  }
+  res.setHeader("Accept-Ranges", "bytes");
+  if (result.ContentLength != null) {
+    res.setHeader("Content-Length", result.ContentLength.toString());
+  }
+  if (options.partial && result.ContentRange) {
+    res.status(206);
+    res.setHeader("Content-Range", result.ContentRange);
+  }
+  if (result.ETag) {
+    res.setHeader("ETag", result.ETag);
+  }
+  if (result.LastModified) {
+    res.setHeader("Last-Modified", result.LastModified.toUTCString());
+  }
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+};
+
+mediaRouter.head("/public/*", async (req, res, next) => {
+  try {
+    const objectKey = getPublicObjectKey(req);
+    const result = await headObject(objectKey);
+    setMediaHeaders(res, result);
+    res.status(200).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
 mediaRouter.get("/public/*", async (req, res, next) => {
   try {
-    const wildcardParams = req.params as Record<string, string | string[] | undefined>;
-    const rawObjectKey = wildcardParams["0"] ?? wildcardParams[""];
-    const objectKey = decodeURIComponent(
-      Array.isArray(rawObjectKey) ? rawObjectKey[0] ?? "" : rawObjectKey ?? ""
-    );
+    const objectKey = getPublicObjectKey(req);
     const rangeHeader = req.header("range")?.trim();
     const result = await getObject(objectKey, rangeHeader);
-
-    if (result.ContentType) {
-      res.setHeader("Content-Type", result.ContentType);
-    }
-    res.setHeader("Accept-Ranges", "bytes");
-    if (result.ContentLength != null) {
-      res.setHeader("Content-Length", result.ContentLength.toString());
-    }
-    if (rangeHeader && result.ContentRange) {
-      res.status(206);
-      res.setHeader("Content-Range", result.ContentRange);
-    }
-    if (result.ETag) {
-      res.setHeader("ETag", result.ETag);
-    }
-    if (result.LastModified) {
-      res.setHeader("Last-Modified", result.LastModified.toUTCString());
-    }
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    setMediaHeaders(res, result, { partial: Boolean(rangeHeader && result.ContentRange) });
 
     const body = result.Body as NodeJS.ReadableStream | undefined;
     if (!body) {
