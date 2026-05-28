@@ -115,8 +115,14 @@ const setMediaHeaders = (
 mediaRouter.head("/public/*", async (req, res, next) => {
   try {
     const objectKey = getPublicObjectKey(req);
+    console.info("Media HEAD requested", { objectKey });
     const result = await headObject(objectKey);
     setMediaHeaders(res, result);
+    console.info("Media HEAD ready", {
+      objectKey,
+      contentType: result.ContentType,
+      contentLength: result.ContentLength
+    });
     res.status(200).end();
   } catch (error) {
     next(error);
@@ -127,8 +133,17 @@ mediaRouter.get("/public/*", async (req, res, next) => {
   try {
     const objectKey = getPublicObjectKey(req);
     const rangeHeader = req.header("range")?.trim();
+    console.info("Media GET requested", { objectKey, range: rangeHeader ?? null });
     const result = await getObject(objectKey, rangeHeader);
     setMediaHeaders(res, result, { partial: Boolean(rangeHeader && result.ContentRange) });
+    console.info("Media GET ready", {
+      objectKey,
+      range: rangeHeader ?? null,
+      status: rangeHeader && result.ContentRange ? 206 : 200,
+      contentType: result.ContentType,
+      contentLength: result.ContentLength,
+      contentRange: result.ContentRange ?? null
+    });
 
     const body = result.Body as NodeJS.ReadableStream | undefined;
     if (!body) {
@@ -136,7 +151,17 @@ mediaRouter.get("/public/*", async (req, res, next) => {
       return;
     }
 
-    body.on("error", next);
+    body.on("error", (error) => {
+      console.error("Media stream failed", {
+        objectKey,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      if (!res.headersSent) {
+        next(error);
+      } else {
+        res.destroy(error instanceof Error ? error : undefined);
+      }
+    });
     body.pipe(res);
   } catch (error) {
     next(error);

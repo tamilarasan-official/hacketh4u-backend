@@ -71,6 +71,39 @@ type MultipartUploadAbortInput = {
   uploadId: string;
 };
 
+const GARAGE_READ_TIMEOUT_MS = 12_000;
+
+async function withGarageTimeout<T>(
+  operation: string,
+  objectKey: string,
+  run: (abortSignal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), GARAGE_READ_TIMEOUT_MS);
+
+  try {
+    return await run(abortController.signal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Garage media operation failed", {
+      operation,
+      objectKey,
+      message
+    });
+
+    if (abortController.signal.aborted) {
+      throw new HttpError(504, "Media storage request timed out.", {
+        operation,
+        objectKey
+      });
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function buildObjectKey(input: RequestUploadInput): string {
   const safeFileName = input.fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
   return `${input.folder}/${input.userId}/${Date.now()}_${safeFileName}`;
@@ -345,12 +378,18 @@ export async function getObject(objectKey: string, range?: string) {
     throw new HttpError(400, "objectKey is required.");
   }
 
-  return garageS3.send(
-    new GetObjectCommand({
-      Bucket: env.GARAGE_S3_BUCKET,
-      Key: objectKey,
-      ...(range ? { Range: range } : {})
-    })
+  return withGarageTimeout(
+    "getObject",
+    objectKey,
+    (abortSignal) =>
+      garageS3.send(
+        new GetObjectCommand({
+          Bucket: env.GARAGE_S3_BUCKET,
+          Key: objectKey,
+          ...(range ? { Range: range } : {})
+        }),
+        { abortSignal }
+      )
   );
 }
 
@@ -359,11 +398,17 @@ export async function headObject(objectKey: string) {
     throw new HttpError(400, "objectKey is required.");
   }
 
-  return garageS3.send(
-    new HeadObjectCommand({
-      Bucket: env.GARAGE_S3_BUCKET,
-      Key: objectKey
-    })
+  return withGarageTimeout(
+    "headObject",
+    objectKey,
+    (abortSignal) =>
+      garageS3.send(
+        new HeadObjectCommand({
+          Bucket: env.GARAGE_S3_BUCKET,
+          Key: objectKey
+        }),
+        { abortSignal }
+      )
   );
 }
 
