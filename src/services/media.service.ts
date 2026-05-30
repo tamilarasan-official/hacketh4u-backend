@@ -15,6 +15,7 @@ import { firestore } from "../config/firebase";
 import { env } from "../config/env";
 import { garageS3, garageSigningRegion } from "../config/garage";
 import { HttpError } from "../utils/http-error";
+import { processGarageVideoToHls } from "./video-processing.service";
 
 type UploadFolder =
   | "user-profiles"
@@ -72,6 +73,10 @@ type MultipartUploadAbortInput = {
 };
 
 const GARAGE_READ_TIMEOUT_MS = 12_000;
+
+function shouldProcessVideo(folderOrObjectKey: string, contentType: string): boolean {
+  return folderOrObjectKey.startsWith("videos/raw") && contentType.toLowerCase().startsWith("video/");
+}
 
 async function withGarageTimeout<T>(
   operation: string,
@@ -208,6 +213,45 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
   };
 
   const docRef = await firestore.collection("media_uploads").add(record);
+
+  if (shouldProcessVideo(input.folder, input.contentType)) {
+    try {
+      await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
+      const processed = await processGarageVideoToHls({
+        objectKey,
+        publicUrl,
+        contentType: input.contentType
+      });
+      await docRef.set(
+        {
+          ...processed,
+          status: "processed",
+          updatedAt: new Date()
+        },
+        { merge: true }
+      );
+
+      return {
+        id: docRef.id,
+        objectKey,
+        publicUrl,
+        ...processed
+      };
+    } catch (error) {
+      console.error("Video HLS processing failed", {
+        objectKey,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      await docRef.set(
+        {
+          status: "processing_failed",
+          processingError: error instanceof Error ? error.message : String(error),
+          updatedAt: new Date()
+        },
+        { merge: true }
+      );
+    }
+  }
 
   return {
     id: docRef.id,
@@ -351,6 +395,45 @@ export async function completeMultipartUpload(
   };
 
   const docRef = await firestore.collection("media_uploads").add(record);
+
+  if (shouldProcessVideo(input.objectKey, input.contentType)) {
+    try {
+      await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
+      const processed = await processGarageVideoToHls({
+        objectKey: input.objectKey,
+        publicUrl: input.publicUrl,
+        contentType: input.contentType
+      });
+      await docRef.set(
+        {
+          ...processed,
+          status: "processed",
+          updatedAt: new Date()
+        },
+        { merge: true }
+      );
+
+      return {
+        id: docRef.id,
+        objectKey: input.objectKey,
+        publicUrl: input.publicUrl,
+        ...processed
+      };
+    } catch (error) {
+      console.error("Video HLS processing failed", {
+        objectKey: input.objectKey,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      await docRef.set(
+        {
+          status: "processing_failed",
+          processingError: error instanceof Error ? error.message : String(error),
+          updatedAt: new Date()
+        },
+        { merge: true }
+      );
+    }
+  }
 
   return {
     id: docRef.id,
