@@ -68,7 +68,9 @@ const envSchema = z.object({
   GARAGE_S3_ACCESS_KEY_ID: z.string().min(1),
   GARAGE_S3_SECRET_ACCESS_KEY: z.string().min(1),
   GARAGE_S3_PUBLIC_BASE_URL: z.string().url(),
-  GARAGE_S3_FORCE_PATH_STYLE: z.string().default("true")
+  // Virtual-hosted addressing is the default. Self-hosted stores such as
+  // Garage need this set to "true" explicitly.
+  GARAGE_S3_FORCE_PATH_STYLE: z.string().default("false")
 });
 
 const parsed = envSchema.safeParse(resolvedEnv);

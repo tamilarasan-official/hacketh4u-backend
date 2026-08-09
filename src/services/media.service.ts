@@ -119,7 +119,9 @@ function buildPublicMediaUrl(objectKey: string): string {
   if (baseUrl) {
     return `${baseUrl}/media/public/${objectKey}`;
   }
-  return `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${env.GARAGE_S3_BUCKET}/${objectKey}`;
+  // The bucket is part of the public base URL (virtual-hosted addressing), so
+  // it must not be repeated in the path.
+  return `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`;
 }
 
 export async function createSignedUpload(input: RequestUploadInput): Promise<Record<string, unknown>> {
