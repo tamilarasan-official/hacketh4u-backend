@@ -83,6 +83,7 @@ const getPublicObjectKey = (req: express.Request): string => {
 
 const setMediaHeaders = (
   res: express.Response,
+  objectKey: string,
   result: {
     ContentType?: string;
     ContentLength?: number;
@@ -92,7 +93,15 @@ const setMediaHeaders = (
   },
   options: { partial?: boolean } = {}
 ) => {
-  if (result.ContentType) {
+  const storedContentType = result.ContentType?.toLowerCase();
+  const fallbackContentType = objectKey.toLowerCase().endsWith(".m3u8")
+    ? "application/vnd.apple.mpegurl"
+    : objectKey.toLowerCase().endsWith(".ts")
+      ? "video/mp2t"
+      : undefined;
+  if (fallbackContentType && (!storedContentType || storedContentType === "application/octet-stream")) {
+    res.setHeader("Content-Type", fallbackContentType);
+  } else if (result.ContentType) {
     res.setHeader("Content-Type", result.ContentType);
   }
   res.setHeader("Accept-Ranges", "bytes");
@@ -117,7 +126,7 @@ mediaRouter.head("/public/*", async (req, res, next) => {
     const objectKey = getPublicObjectKey(req);
     console.info("Media HEAD requested", { objectKey });
     const result = await headObject(objectKey);
-    setMediaHeaders(res, result);
+    setMediaHeaders(res, objectKey, result);
     console.info("Media HEAD ready", {
       objectKey,
       contentType: result.ContentType,
@@ -135,7 +144,7 @@ mediaRouter.get("/public/*", async (req, res, next) => {
     const rangeHeader = req.header("range")?.trim();
     console.info("Media GET requested", { objectKey, range: rangeHeader ?? null });
     const result = await getObject(objectKey, rangeHeader);
-    setMediaHeaders(res, result, { partial: Boolean(rangeHeader && result.ContentRange) });
+    setMediaHeaders(res, objectKey, result, { partial: Boolean(rangeHeader && result.ContentRange) });
     console.info("Media GET ready", {
       objectKey,
       range: rangeHeader ?? null,

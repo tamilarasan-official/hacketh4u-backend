@@ -72,7 +72,8 @@ type MultipartUploadAbortInput = {
   uploadId: string;
 };
 
-const GARAGE_READ_TIMEOUT_MS = 12_000;
+const GARAGE_READ_TIMEOUT_MS = 20_000;
+const GARAGE_READ_ATTEMPTS = 2;
 
 function shouldProcessVideo(folderOrObjectKey: string, contentType: string): boolean {
   return folderOrObjectKey.startsWith("videos/raw") && contentType.toLowerCase().startsWith("video/");
@@ -83,30 +84,48 @@ async function withGarageTimeout<T>(
   objectKey: string,
   run: (abortSignal: AbortSignal) => Promise<T>
 ): Promise<T> {
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), GARAGE_READ_TIMEOUT_MS);
+  let lastError: unknown;
 
-  try {
-    return await run(abortController.signal);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("Garage media operation failed", {
-      operation,
-      objectKey,
-      message
-    });
+  for (let attempt = 1; attempt <= GARAGE_READ_ATTEMPTS; attempt += 1) {
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), GARAGE_READ_TIMEOUT_MS);
 
-    if (abortController.signal.aborted) {
-      throw new HttpError(504, "Media storage request timed out.", {
+    try {
+      return await run(abortController.signal);
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("Garage media operation failed", {
         operation,
-        objectKey
+        objectKey,
+        attempt,
+        message
       });
-    }
 
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+      const statusCode = (error as { $metadata?: { httpStatusCode?: number } }).$metadata
+        ?.httpStatusCode;
+      const retryable = abortController.signal.aborted ||
+        statusCode == null ||
+        statusCode >= 500 ||
+        /ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket|timeout/i.test(message);
+
+      if (!retryable || attempt === GARAGE_READ_ATTEMPTS) {
+        if (abortController.signal.aborted) {
+          throw new HttpError(504, "Media storage request timed out.", {
+            operation,
+            objectKey
+          });
+        }
+        throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+
+  throw lastError;
 }
 
 function buildObjectKey(input: RequestUploadInput): string {
