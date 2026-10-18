@@ -1,5 +1,6 @@
 import { S3Client } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
+import dns from "node:dns";
 import https from "node:https";
 import { env } from "./env";
 
@@ -14,14 +15,18 @@ export const garageS3 = new S3Client({
   forcePathStyle: env.GARAGE_S3_FORCE_PATH_STYLE,
   maxAttempts: 1,
   requestHandler: new NodeHttpHandler({
-    connectionTimeout: 5_000,
+    connectionTimeout: 10_000,
     requestTimeout: 25_000,
     socketTimeout: 25_000,
     // Spaces connections can become stale in a long-lived API process. A
     // fresh socket per request is more reliable than reusing a dead socket.
     httpsAgent: new https.Agent({
       keepAlive: false,
-      maxSockets: 32
+      maxSockets: 32,
+      // Dokploy hosts can prefer an unreachable IPv6 route for Spaces.
+      // Force IPv4 so media reads do not fail before reaching the bucket.
+      lookup: (hostname, options, callback) =>
+        dns.lookup(hostname, { ...options, family: 4 }, callback)
     })
   }),
   // DigitalOcean Spaces rejects the CRC32 integrity headers newer AWS SDK
