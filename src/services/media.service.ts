@@ -15,7 +15,7 @@ import { firestore } from "../config/firebase";
 import { env } from "../config/env";
 import { garageS3, garageSigningRegion } from "../config/garage";
 import { HttpError } from "../utils/http-error";
-import { processGarageVideoToHls } from "./video-processing.service";
+import { enqueueVideoProcessing } from "./job-queue.service";
 
 type UploadFolder =
   | "user-profiles"
@@ -143,6 +143,24 @@ function buildPublicMediaUrl(objectKey: string): string {
   return `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`;
 }
 
+function buildHlsUrls(objectKey: string): {
+  streamingUrl: string;
+  qualities: Record<string, string>;
+  hlsObjectPrefix: string;
+} {
+  const hlsObjectPrefix = objectKey
+    .replace(/^videos\/raw\//, "videos/hls/")
+    .replace(/\.[^.]+$/, "");
+  return {
+    streamingUrl: buildPublicMediaUrl(`${hlsObjectPrefix}/master.m3u8`),
+    qualities: {
+      "720p": buildPublicMediaUrl(`${hlsObjectPrefix}/720p/index.m3u8`),
+      "480p": buildPublicMediaUrl(`${hlsObjectPrefix}/480p/index.m3u8`)
+    },
+    hlsObjectPrefix
+  };
+}
+
 export async function createSignedUpload(input: RequestUploadInput): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
@@ -238,25 +256,20 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
   if (shouldProcessVideo(input.folder, input.contentType)) {
     try {
       await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
-      const processed = await processGarageVideoToHls({
+      const jobId = await enqueueVideoProcessing({
+        mediaId: docRef.id,
         objectKey,
         publicUrl,
         contentType: input.contentType
       });
-      await docRef.set(
-        {
-          ...processed,
-          status: "processed",
-          updatedAt: new Date()
-        },
-        { merge: true }
-      );
 
       return {
         id: docRef.id,
         objectKey,
         publicUrl,
-        ...processed
+        status: "processing",
+        jobId,
+        ...buildHlsUrls(objectKey)
       };
     } catch (error) {
       console.error("Video HLS processing failed", {
@@ -420,25 +433,20 @@ export async function completeMultipartUpload(
   if (shouldProcessVideo(input.objectKey, input.contentType)) {
     try {
       await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
-      const processed = await processGarageVideoToHls({
+      const jobId = await enqueueVideoProcessing({
+        mediaId: docRef.id,
         objectKey: input.objectKey,
         publicUrl: input.publicUrl,
         contentType: input.contentType
       });
-      await docRef.set(
-        {
-          ...processed,
-          status: "processed",
-          updatedAt: new Date()
-        },
-        { merge: true }
-      );
 
       return {
         id: docRef.id,
         objectKey: input.objectKey,
         publicUrl: input.publicUrl,
-        ...processed
+        status: "processing",
+        jobId,
+        ...buildHlsUrls(input.objectKey)
       };
     } catch (error) {
       console.error("Video HLS processing failed", {
