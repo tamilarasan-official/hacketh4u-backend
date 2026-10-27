@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { performance } from "../config/performance";
+import { performance, playbackSessionsEnabled } from "../config/performance";
 import { env } from "../config/env";
 import { firestore } from "../config/firebase";
 import { getCourseEntitlement } from "./entitlement.service";
@@ -62,11 +62,14 @@ export async function createPlayback(
   videoId: string,
 ) {
   if (
-    !performance.PROTECTED_PLAYBACK ||
+    !playbackSessionsEnabled() ||
     !performance.PLAYBACK_SECRET ||
     !env.APP_BASE_URL
   )
     throw new HttpError(503, "Protected playback is not enabled.");
+  const testers = performance.PLAYBACK_TEST_USER_IDS.split(",").map(x => x.trim()).filter(Boolean);
+  if (testers.length && !testers.includes(uid))
+    throw new HttpError(403, "Playback session pilot is restricted to test users.");
   await requireCourseAccess(uid, courseId);
   const video = (
     await firestore.collection("videos").doc(videoId).get()

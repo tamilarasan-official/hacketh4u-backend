@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
-import { performance } from "../config/performance";
+import { performance, playbackSessionsEnabled } from "../config/performance";
 import {
   createPlayback,
   verifyPlayback,
@@ -28,7 +28,7 @@ playbackRouter.post("/session", requireAuth, async (req, res, next) => {
 });
 playbackRouter.get("/media/:token/*", async (req, res, next) => {
   try {
-    if (!performance.PROTECTED_PLAYBACK || !performance.PLAYBACK_SECRET)
+    if (!playbackSessionsEnabled() || !performance.PLAYBACK_SECRET)
       throw new HttpError(403, "Protected playback disabled.");
     const key = String((req.params as unknown as Record<string, string>)["0"]);
     const claims = verifyPlayback(

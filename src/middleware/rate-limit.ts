@@ -1,42 +1,27 @@
-import type { RequestHandler } from "express";
-import { createHash } from "node:crypto";
+import type { RequestHandler, Response } from "express";
 import { performance } from "../config/performance";
 import { redisConnection } from "../config/queues";
+import { consumeAdmission } from "../services/admission.service";
 import { HttpError } from "../utils/http-error";
-const script =
-  "local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],60) end; return n";
-export const rateLimit: RequestHandler = async (req, res, next) => {
-  if (
-    !performance.RATE_LIMIT_ENABLED ||
-    req.path.startsWith("/health") ||
-    req.path === "/payments/webhooks/razorpay"
-  )
-    return next();
-  if (redisConnection.status !== "ready")
-    return next(
-      new HttpError(503, "Request admission temporarily unavailable."),
-    );
-  try {
-    const identity = createHash("sha256")
-      .update(req.ip ?? req.socket.remoteAddress ?? "unknown")
-      .digest("hex");
-    const count = Number(
-      await redisConnection.eval(
-        script,
-        1,
-        `rate:${identity}:${Math.floor(Date.now() / 60000)}`,
-      ),
-    );
-    if (count > performance.RATE_LIMIT_PER_MINUTE) {
-      res.setHeader("Retry-After", "60");
-      throw new HttpError(429, "Too many requests.");
-    }
-    next();
-  } catch (error) {
-    next(
-      error instanceof HttpError
-        ? error
-        : new HttpError(503, "Request admission temporarily unavailable."),
-    );
+async function enforce(scope: string, identity: string, budget: number, res: Response) {
+  const result = await consumeAdmission(redisConnection, scope, identity, budget);
+  if (!result.allowed) {
+    res.setHeader("Retry-After", String(result.retryAfter));
+    throw new HttpError(429, "Too many requests.");
   }
+}
+export async function limitAuthenticatedUser(uid: string, res: Response) {
+  if (performance.RATE_LIMIT_ENABLED) await enforce("user-api", uid, performance.RATE_LIMIT_PER_MINUTE, res);
+}
+export const rateLimit: RequestHandler = async (req, res, next) => {
+  const read = req.method === "GET" || req.method === "HEAD";
+  if (!performance.RATE_LIMIT_ENABLED ||
+      (read && /^\/health(?:\/(?:ready|metrics|diagnostics))?\/?$/.test(req.path)) ||
+      (req.method === "POST" && req.path === "/payments/webhooks/razorpay")) return next();
+  try {
+    const media = read && /^(?:\/media\/(?:public|image-origin)\/|\/playback\/media\/)/.test(req.path);
+    await enforce(media ? "ip-media" : "ip-api", req.ip ?? req.socket.remoteAddress ?? "unknown",
+      media ? performance.RATE_LIMIT_MEDIA_PER_MINUTE : performance.RATE_LIMIT_IP_PER_MINUTE, res);
+    next();
+  } catch (error) { next(error); }
 };

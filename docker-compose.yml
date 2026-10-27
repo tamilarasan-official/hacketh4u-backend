@@ -52,6 +52,28 @@ services:
   api-2:
     <<: *api
 
+  # Opt-in disposable cache; never shares queue data or persistence settings.
+  profile-cache:
+    profiles: ["cache"]
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    environment:
+      CACHE_REDIS_PASSWORD: ${CACHE_REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -c
+      - >-
+        test -n "$${CACHE_REDIS_PASSWORD}" || exit 1;
+        exec redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+        --appendonly no --save "" --requirepass "$${CACHE_REDIS_PASSWORD}"
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$CACHE_REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped

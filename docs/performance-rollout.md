@@ -1,5 +1,7 @@
 # Local implementation and staged rollout
 
+For the next optional-feature release, follow [backend-feature-rollout.md](backend-feature-rollout.md). It supersedes the coupled playback activation step below with a sessions-only pilot, separate cache service, and split rate budgets. The historical validation below describes the earlier compatibility release.
+
 Production has not been deployed, restarted, load-tested again or mutated by this implementation task. Commit and push follow local validation and review; deployment is a separate manual action while Dokploy Autodeploy is off.
 
 ## Compatibility

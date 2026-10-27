@@ -22,13 +22,26 @@ export function assertOwner(key: string, userId: string): void {
   if (owner !== userId)
     throw new HttpError(403, "Object belongs to another user.");
 }
+const publicImageFolders = new Set([
+  "user-profiles", "course-thumbnails", "mentor-profiles", "banner-images", "video-thumbnails",
+]);
+export function isPublicImageKey(key: string): boolean {
+  return publicImageFolders.has(key.split("/")[0]);
+}
+export function imageCdnUrl(key: string): string | undefined {
+  validateObjectKey(key);
+  if (!isPublicImageKey(key) || !performance.PUBLIC_MEDIA_BASE_URL) return;
+  if (env.APP_BASE_URL && new URL(performance.PUBLIC_MEDIA_BASE_URL).origin === new URL(env.APP_BASE_URL).origin)
+    throw new HttpError(503, "Image delivery origin must be separate from the API origin.");
+  return performance.PUBLIC_MEDIA_BASE_URL.replace(/\/$/, "") + "/" + key.split("/").map(encodeURIComponent).join("/");
+}
 export function buildPublicMediaUrl(key: string): string {
   validateObjectKey(key);
   const encoded = key.split("/").map(encodeURIComponent).join("/");
+  const cdn = imageCdnUrl(key);
+  if (cdn) return cdn;
   const base =
-    !key.startsWith("videos/") && performance.PUBLIC_MEDIA_BASE_URL
-      ? performance.PUBLIC_MEDIA_BASE_URL
-      : env.APP_BASE_URL
+    env.APP_BASE_URL
         ? env.APP_BASE_URL.replace(/\/$/, "") + "/media/public"
         : env.GARAGE_S3_PUBLIC_BASE_URL;
   return base.replace(/\/$/, "") + "/" + encoded;

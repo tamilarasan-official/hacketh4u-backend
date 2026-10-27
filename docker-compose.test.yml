@@ -5,3 +5,8 @@ services:
     ports: ["127.0.0.1:16379:6379"]
     command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "local-test-only"]
     mem_limit: 128m
+  profile-cache:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:16380:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "local-cache-only", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    mem_limit: 128m

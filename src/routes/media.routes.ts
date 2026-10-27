@@ -20,6 +20,8 @@ import { pipeline } from "node:stream/promises";
 import {
   mediaCacheControl,
   validateObjectKey,
+  isPublicImageKey,
+  imageCdnUrl,
 } from "../services/media-url.service";
 import { performance } from "../config/performance";
 
@@ -141,6 +143,7 @@ export async function serveMedia(
   next: express.NextFunction,
   objectKey: string,
   privateMedia = false,
+  imageOrigin = false,
 ) {
   const controller = new AbortController();
   const cancel = () => {
@@ -155,6 +158,15 @@ export async function serveMedia(
       objectKey.startsWith("videos/")
     )
       throw new HttpError(403, "Use an authorized playback session.");
+    if (!privateMedia && !imageOrigin && performance.IMAGE_CDN_REDIRECT_ENABLED) {
+      const target = imageCdnUrl(objectKey);
+      if (target) {
+        // Never permanently cache a redirect: switching the flag off must roll back immediately.
+        res.setHeader("Cache-Control", "no-store");
+        res.redirect(307, target);
+        return;
+      }
+    }
     if (req.method === "HEAD") {
       const result = await headObject(objectKey, controller.signal);
       setMediaHeaders(res, objectKey, result);
@@ -193,6 +205,14 @@ export async function serveMedia(
     body?.destroy();
   }
 }
+// Pull-CDN origin: serves only the already-public image folders, never videos.
+mediaRouter.route("/image-origin/*").get((req, res, next) => {
+  try {
+    const key = getPublicObjectKey(req);
+    if (!isPublicImageKey(key)) throw new HttpError(404, "Image not found.");
+    void serveMedia(req, res, next, key, false, true);
+  } catch (error) { next(error); }
+});
 mediaRouter.use("/public", (req, _res, next) => {
   if (performance.PROTECTED_PLAYBACK && /^\/videos\//.test(req.path))
     return next(new HttpError(403, "Use an authorized playback session."));
