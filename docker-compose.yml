@@ -26,7 +26,8 @@ x-api: &api
 
 services:
   backend:
-    image: nginx:1.27-alpine
+    # Upstream DNS re-resolution requires open-source Nginx >= 1.27.3.
+    image: nginx:1.27.5-alpine
     restart: unless-stopped
     mem_limit: 256m
     cpus: 0.5
