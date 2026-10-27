@@ -13,9 +13,15 @@ import {
   headObject,
   initiateMultipartUpload,
   uploadMultipartPart,
-  uploadObjectDirect
+  uploadObjectDirect,
 } from "../services/media.service";
 import { HttpError } from "../utils/http-error";
+import { pipeline } from "node:stream/promises";
+import {
+  mediaCacheControl,
+  validateObjectKey,
+} from "../services/media-url.service";
+import { performance } from "../config/performance";
 
 const uploadRequestSchema = z.object({
   fileName: z.string().min(1),
@@ -27,8 +33,8 @@ const uploadRequestSchema = z.object({
     "banner-images",
     "certificate-templates",
     "video-thumbnails",
-    "videos/raw"
-  ])
+    "videos/raw",
+  ]),
 });
 
 const completeUploadSchema = z.object({
@@ -36,17 +42,17 @@ const completeUploadSchema = z.object({
   publicUrl: z.string().url(),
   entityType: z.string().min(1),
   entityId: z.string().min(1),
-  contentType: z.string().min(1)
+  contentType: z.string().min(1),
 });
 
 const deleteObjectSchema = z.object({
-  objectKey: z.string().min(1)
+  objectKey: z.string().min(1),
 });
 
 const multipartInitSchema = uploadRequestSchema.extend({
   entityType: z.string().min(1),
   entityId: z.string().min(1),
-  fileSize: z.number().positive().optional()
+  fileSize: z.number().positive().optional(),
 });
 
 const multipartCompleteSchema = z.object({
@@ -60,24 +66,29 @@ const multipartCompleteSchema = z.object({
     .array(
       z.object({
         partNumber: z.number().int().positive(),
-        eTag: z.string().min(1)
-      })
+        eTag: z.string().min(1),
+      }),
     )
-    .min(1)
+    .min(1),
 });
 
 const multipartAbortSchema = z.object({
   uploadId: z.string().min(1),
-  objectKey: z.string().min(1)
+  objectKey: z.string().min(1),
 });
 
 export const mediaRouter = Router();
 
 const getPublicObjectKey = (req: express.Request): string => {
-  const wildcardParams = req.params as Record<string, string | string[] | undefined>;
+  const wildcardParams = req.params as Record<
+    string,
+    string | string[] | undefined
+  >;
   const rawObjectKey = wildcardParams["0"] ?? wildcardParams[""];
-  return decodeURIComponent(
-    Array.isArray(rawObjectKey) ? rawObjectKey[0] ?? "" : rawObjectKey ?? ""
+  return validateObjectKey(
+    Array.isArray(rawObjectKey)
+      ? (rawObjectKey[0] ?? "")
+      : (rawObjectKey ?? ""),
   );
 };
 
@@ -91,7 +102,7 @@ const setMediaHeaders = (
     ETag?: string;
     LastModified?: Date;
   },
-  options: { partial?: boolean } = {}
+  options: { partial?: boolean } = {},
 ) => {
   const storedContentType = result.ContentType?.toLowerCase();
   const fallbackContentType = objectKey.toLowerCase().endsWith(".m3u8")
@@ -99,7 +110,10 @@ const setMediaHeaders = (
     : objectKey.toLowerCase().endsWith(".ts")
       ? "video/mp2t"
       : undefined;
-  if (fallbackContentType && (!storedContentType || storedContentType === "application/octet-stream")) {
+  if (
+    fallbackContentType &&
+    (!storedContentType || storedContentType === "application/octet-stream")
+  ) {
     res.setHeader("Content-Type", fallbackContentType);
   } else if (result.ContentType) {
     res.setHeader("Content-Type", result.ContentType);
@@ -118,89 +132,112 @@ const setMediaHeaders = (
   if (result.LastModified) {
     res.setHeader("Last-Modified", result.LastModified.toUTCString());
   }
-  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.setHeader("Cache-Control", mediaCacheControl(objectKey));
 };
 
-mediaRouter.head("/public/*", async (req, res, next) => {
+export async function serveMedia(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+  objectKey: string,
+  privateMedia = false,
+) {
+  const controller = new AbortController();
+  const cancel = () => {
+    if (!res.writableFinished) controller.abort();
+  };
+  res.once("close", cancel);
+  let body: Readable | undefined;
   try {
-    const objectKey = getPublicObjectKey(req);
-    console.info("Media HEAD requested", { objectKey });
-    const result = await headObject(objectKey);
-    setMediaHeaders(res, objectKey, result);
-    console.info("Media HEAD ready", {
-      objectKey,
-      contentType: result.ContentType,
-      contentLength: result.ContentLength
-    });
-    res.status(200).end();
-  } catch (error) {
-    next(error);
-  }
-});
-
-mediaRouter.get("/public/*", async (req, res, next) => {
-  try {
-    const objectKey = getPublicObjectKey(req);
-    const rangeHeader = req.header("range")?.trim();
-    console.info("Media GET requested", { objectKey, range: rangeHeader ?? null });
-    const result = await getObject(objectKey, rangeHeader);
-    setMediaHeaders(res, objectKey, result, { partial: Boolean(rangeHeader && result.ContentRange) });
-    console.info("Media GET ready", {
-      objectKey,
-      range: rangeHeader ?? null,
-      status: rangeHeader && result.ContentRange ? 206 : 200,
-      contentType: result.ContentType,
-      contentLength: result.ContentLength,
-      contentRange: result.ContentRange ?? null
-    });
-
-    const body = result.Body as NodeJS.ReadableStream | undefined;
-    if (!body) {
-      res.status(404).json({ error: "Object not found." });
+    if (
+      performance.PROTECTED_PLAYBACK &&
+      !privateMedia &&
+      objectKey.startsWith("videos/")
+    )
+      throw new HttpError(403, "Use an authorized playback session.");
+    if (req.method === "HEAD") {
+      const result = await headObject(objectKey, controller.signal);
+      setMediaHeaders(res, objectKey, result);
+      res.setHeader(
+        "Cache-Control",
+        mediaCacheControl(objectKey, privateMedia),
+      );
+      res.status(200).end();
       return;
     }
-
-    body.on("error", (error) => {
-      console.error("Media stream failed", {
-        objectKey,
-        message: error instanceof Error ? error.message : String(error)
-      });
-      if (!res.headersSent) {
-        next(error);
-      } else {
-        res.destroy(error instanceof Error ? error : undefined);
-      }
+    const rangeHeader = req.header("range")?.trim();
+    const result = await getObject(objectKey, rangeHeader, controller.signal);
+    setMediaHeaders(res, objectKey, result, {
+      partial: Boolean(rangeHeader && result.ContentRange),
     });
-    body.pipe(res);
+    res.setHeader("Cache-Control", mediaCacheControl(objectKey, privateMedia));
+    body = result.Body as Readable | undefined;
+    if (!body) {
+      throw new HttpError(404, "Media not found.");
+    }
+    if (
+      !rangeHeader &&
+      result.ETag &&
+      req.header("if-none-match") === result.ETag
+    ) {
+      body.destroy();
+      res.removeHeader("Content-Length");
+      res.status(304).end();
+      return;
+    }
+    await pipeline(body, res, { signal: controller.signal });
   } catch (error) {
-    next(error);
+    if (!controller.signal.aborted) next(error);
+  } finally {
+    res.off("close", cancel);
+    body?.destroy();
   }
+}
+mediaRouter.use("/public", (req, _res, next) => {
+  if (performance.PROTECTED_PLAYBACK && /^\/videos\//.test(req.path))
+    return next(new HttpError(403, "Use an authorized playback session."));
+  next();
 });
-
-mediaRouter.post(
-  "/upload",
-  requireAuth,
-  async (req, res, next) => {
+mediaRouter
+  .route("/public/*")
+  .head((req, res, next) => {
     try {
-      const contentTypeHeader = req.header("content-type") ?? "";
-      const fileSizeHeader = req.header("x-file-size")?.trim();
-      const fileSize = fileSizeHeader ? Number(fileSizeHeader) : undefined;
+      void serveMedia(req, res, next, getPublicObjectKey(req));
+    } catch (e) {
+      next(e);
+    }
+  })
+  .get((req, res, next) => {
+    try {
+      void serveMedia(req, res, next, getPublicObjectKey(req));
+    } catch (e) {
+      next(e);
+    }
+  });
 
-      if (contentTypeHeader.toLowerCase().includes("multipart/form-data")) {
-        const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+mediaRouter.post("/upload", requireAuth, async (req, res, next) => {
+  try {
+    const contentTypeHeader = req.header("content-type") ?? "";
+    const fileSizeHeader = req.header("x-file-size")?.trim();
+    const fileSize = fileSizeHeader ? Number(fileSizeHeader) : undefined;
+
+    if (contentTypeHeader.toLowerCase().includes("multipart/form-data")) {
+      const result = await new Promise<Record<string, unknown>>(
+        (resolve, reject) => {
           const busboy = Busboy({
             headers: req.headers,
             limits: {
               files: 1,
-              fileSize: 1024 * 1024 * 1024
-            }
+              fileSize: 1024 * 1024 * 1024,
+            },
           });
 
           let fileName = req.header("x-file-name")?.trim() ?? "";
           let folder = req.header("x-folder")?.trim() ?? "";
           let entityType = req.header("x-entity-type")?.trim() ?? "";
           let entityId = req.header("x-entity-id")?.trim() ?? "";
-          let declaredContentType = req.header("x-upload-content-type")?.trim() ?? "";
+          let declaredContentType =
+            req.header("x-upload-content-type")?.trim() ?? "";
           let fileStream: Readable | null = null;
           let uploadMimeType = "";
           let fileReceived = false;
@@ -239,7 +276,10 @@ mediaRouter.post(
           };
 
           const handleAbort = () => {
-            const abortError = new HttpError(499, "Upload was interrupted by the client.");
+            const abortError = new HttpError(
+              499,
+              "Upload was interrupted by the client.",
+            );
             if (fileStream && !fileStream.destroyed) {
               fileStream.destroy(abortError);
             }
@@ -276,7 +316,9 @@ mediaRouter.post(
 
             if (fileReceived) {
               stream.resume();
-              safeReject(new Error("Only a single file is supported per upload."));
+              safeReject(
+                new Error("Only a single file is supported per upload."),
+              );
               return;
             }
 
@@ -285,14 +327,19 @@ mediaRouter.post(
             uploadMimeType = info.mimeType;
             stream.once("error", safeReject);
             stream.once("limit", () => {
-              safeReject(new Error("Uploaded file exceeds the maximum supported size."));
+              safeReject(
+                new Error("Uploaded file exceeds the maximum supported size."),
+              );
             });
 
             uploadPromise = (async () => {
               const payload = uploadRequestSchema.parse({
                 fileName: fileName || info.filename,
-                contentType: declaredContentType || uploadMimeType || "application/octet-stream",
-                folder
+                contentType:
+                  declaredContentType ||
+                  uploadMimeType ||
+                  "application/octet-stream",
+                folder,
               });
 
               if (!entityType || !entityId) {
@@ -300,8 +347,8 @@ mediaRouter.post(
                   {
                     code: "custom",
                     path: ["entityType"],
-                    message: "entityType and entityId are required."
-                  }
+                    message: "entityType and entityId are required.",
+                  },
                 ]);
               }
 
@@ -311,7 +358,7 @@ mediaRouter.post(
                 fileSize: Number.isFinite(fileSize) ? fileSize : undefined,
                 entityType,
                 entityId,
-                ...payload
+                ...payload,
               });
             })();
 
@@ -329,62 +376,64 @@ mediaRouter.post(
           busboy.on("finish", () => {
             parserFinished = true;
             if (!uploadPromise || !fileReceived) {
-              safeReject(new Error("No file was received in the upload request."));
+              safeReject(
+                new Error("No file was received in the upload request."),
+              );
               return;
             }
             maybeResolve();
           });
 
           req.pipe(busboy);
-        });
+        },
+      );
 
-        res.status(201).json(result);
-        return;
-      }
-
-      const fileName = req.header("x-file-name")?.trim() ?? "";
-      const contentType = req.header("content-type")?.trim() ?? "";
-      const folder = req.header("x-folder")?.trim() ?? "";
-      const entityType = req.header("x-entity-type")?.trim() ?? "";
-      const entityId = req.header("x-entity-id")?.trim() ?? "";
-
-      const payload = uploadRequestSchema.parse({
-        fileName,
-        contentType,
-        folder
-      });
-
-      if (!entityType || !entityId) {
-        throw new z.ZodError([
-          {
-            code: "custom",
-            path: ["entityType"],
-            message: "entityType and entityId are required."
-          }
-        ]);
-      }
-
-      const result = await uploadObjectDirect({
-        userId: req.authUser!.uid,
-        fileStream: req as unknown as Readable,
-        fileSize: Number.isFinite(fileSize) ? fileSize : undefined,
-        entityType,
-        entityId,
-        ...payload
-      });
       res.status(201).json(result);
-    } catch (error) {
-      next(error);
+      return;
     }
+
+    const fileName = req.header("x-file-name")?.trim() ?? "";
+    const contentType = req.header("content-type")?.trim() ?? "";
+    const folder = req.header("x-folder")?.trim() ?? "";
+    const entityType = req.header("x-entity-type")?.trim() ?? "";
+    const entityId = req.header("x-entity-id")?.trim() ?? "";
+
+    const payload = uploadRequestSchema.parse({
+      fileName,
+      contentType,
+      folder,
+    });
+
+    if (!entityType || !entityId) {
+      throw new z.ZodError([
+        {
+          code: "custom",
+          path: ["entityType"],
+          message: "entityType and entityId are required.",
+        },
+      ]);
+    }
+
+    const result = await uploadObjectDirect({
+      userId: req.authUser!.uid,
+      fileStream: req as unknown as Readable,
+      fileSize: Number.isFinite(fileSize) ? fileSize : undefined,
+      entityType,
+      entityId,
+      ...payload,
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
   }
-);
+});
 
 mediaRouter.post("/upload-url", requireAuth, async (req, res, next) => {
   try {
     const payload = uploadRequestSchema.parse(req.body);
     const result = await createSignedUpload({
       userId: req.authUser!.uid,
-      ...payload
+      ...payload,
     });
     res.status(201).json(result);
   } catch (error) {
@@ -397,7 +446,7 @@ mediaRouter.post("/multipart/initiate", requireAuth, async (req, res, next) => {
     const payload = multipartInitSchema.parse(req.body);
     const result = await initiateMultipartUpload({
       userId: req.authUser!.uid,
-      ...payload
+      ...payload,
     });
     res.status(201).json(result);
   } catch (error) {
@@ -410,7 +459,7 @@ mediaRouter.post(
   requireAuth,
   express.raw({
     type: "*/*",
-    limit: "16mb"
+    limit: "16mb",
   }),
   async (req, res, next) => {
     try {
@@ -421,17 +470,18 @@ mediaRouter.post(
       const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from([]);
 
       const result = await uploadMultipartPart({
+        userId: req.authUser!.uid,
         uploadId,
         objectKey,
         partNumber,
-        body
+        body,
       });
 
       res.status(201).json(result);
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 mediaRouter.post("/multipart/complete", requireAuth, async (req, res, next) => {
@@ -439,7 +489,7 @@ mediaRouter.post("/multipart/complete", requireAuth, async (req, res, next) => {
     const payload = multipartCompleteSchema.parse(req.body);
     const result = await completeMultipartUpload({
       userId: req.authUser!.uid,
-      ...payload
+      ...payload,
     });
     res.status(201).json(result);
   } catch (error) {
@@ -450,7 +500,7 @@ mediaRouter.post("/multipart/complete", requireAuth, async (req, res, next) => {
 mediaRouter.post("/multipart/abort", requireAuth, async (req, res, next) => {
   try {
     const payload = multipartAbortSchema.parse(req.body);
-    await abortMultipartUpload(payload);
+    await abortMultipartUpload({ ...payload, userId: req.authUser!.uid });
     res.json({ aborted: true });
   } catch (error) {
     next(error);
@@ -462,7 +512,7 @@ mediaRouter.post("/complete", requireAuth, async (req, res, next) => {
     const payload = completeUploadSchema.parse(req.body);
     const result = await completeUpload({
       userId: req.authUser!.uid,
-      ...payload
+      ...payload,
     });
     res.status(201).json(result);
   } catch (error) {
@@ -475,7 +525,7 @@ mediaRouter.post("/delete", requireAuth, async (req, res, next) => {
     const payload = deleteObjectSchema.parse(req.body);
     const result = await deleteObject({
       userId: req.authUser!.uid,
-      ...payload
+      ...payload,
     });
     res.json(result);
   } catch (error) {

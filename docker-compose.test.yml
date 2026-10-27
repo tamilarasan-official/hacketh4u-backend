@@ -1,0 +1,7 @@
+name: hacketh4u-local-validation
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:16379:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "local-test-only"]
+    mem_limit: 128m

@@ -1,4 +1,5 @@
 import { videoQueue } from "../config/queues";
+import { persistVideoJob } from "./job-outbox.service";
 
 export type VideoProcessingJob = {
   mediaId: string;
@@ -7,9 +8,8 @@ export type VideoProcessingJob = {
   contentType: string;
 };
 
-export async function enqueueVideoProcessing(input: VideoProcessingJob): Promise<string> {
-  const job = await videoQueue.add("process-video", input, {
-    jobId: `video-${input.mediaId}`
-  });
-  return job.id ?? `video-${input.mediaId}`;
+export async function enqueueVideoProcessing(
+  input: VideoProcessingJob,
+): Promise<string> {
+  return persistVideoJob(input);
 }

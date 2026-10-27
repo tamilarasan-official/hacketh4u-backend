@@ -91,3 +91,7 @@ Notes:
 - backups are written under `backend/backups/firebase-reset-<timestamp>/` by default.
 - use `--download-storage` with `tsx src/scripts/reset-firebase.ts` only if you intentionally want local copies of every Firebase Storage object.
 - `firebase:reset-all` requires `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` if old Cloudinary assets should be deleted too.
+# Local performance and reliability work
+
+See [the rollout guide](docs/performance-rollout.md) and [scorecard](docs/performance-scorecard.md).
+New optional settings are documented in `.env.performance.example`. Keep deployment manual until release validation is complete; production capacity has not been established by unit tests.

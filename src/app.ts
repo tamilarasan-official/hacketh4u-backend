@@ -10,37 +10,52 @@ import { entitlementRouter } from "./routes/entitlement.routes";
 import { healthRouter } from "./routes/health.routes";
 import { mediaRouter } from "./routes/media.routes";
 import { paymentRouter } from "./routes/payment.routes";
+import { requestContext } from "./middleware/request-context";
+import { rateLimit } from "./middleware/rate-limit";
+import { performance } from "./config/performance";
+import { playbackRouter } from "./routes/playback.routes";
 
 export function createApp() {
   const app = express();
+  if (performance.TRUSTED_PROXY_CIDRS)
+    app.set(
+      "trust proxy",
+      performance.TRUSTED_PROXY_CIDRS.split(",").map((x) => x.trim()),
+    );
+  app.use(requestContext);
+  app.use(rateLimit);
 
   app.use(helmet());
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (!origin || env.ALLOWED_ORIGINS.length === 0 || env.ALLOWED_ORIGINS.includes(origin)) {
+        if (
+          !origin ||
+          env.ALLOWED_ORIGINS.length === 0 ||
+          env.ALLOWED_ORIGINS.includes(origin)
+        ) {
           callback(null, true);
           return;
         }
         callback(new Error(`Origin not allowed: ${origin}`));
-      }
-    })
+      },
+    }),
   );
-  app.use(morgan("dev"));
   app.use(
     express.json({
-      limit: "10mb",
+      limit: "256kb",
       verify: (req, _res, buf) => {
-        (req as Express.Request).rawBody = buf.toString("utf8");
-      }
-    })
+        if (req.url?.startsWith("/payments/webhooks/"))
+          (req as Express.Request).rawBody = buf.toString("utf8");
+      },
+    }),
   );
 
   app.get("/", (_req, res) => {
     res.json({
       service: "hacketh4u-backend",
       env: env.NODE_ENV,
-      docs: "/health"
+      docs: "/health",
     });
   });
 
@@ -50,6 +65,7 @@ export function createApp() {
   app.use("/payments", paymentRouter);
   app.use("/entitlements", entitlementRouter);
   app.use("/media", mediaRouter);
+  app.use("/playback", playbackRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

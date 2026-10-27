@@ -2,6 +2,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import https from "node:https";
 import { env } from "./env";
+import { performance } from "./performance";
 
 // The configured region is used verbatim. An earlier version rewrote it to
 // "garage" for any non-AWS endpoint, which silently broke SigV4 signing against
@@ -20,15 +21,17 @@ export const garageS3 = new S3Client({
     // Spaces connections can become stale in a long-lived API process. A
     // fresh socket per request is more reliable than reusing a dead socket.
     httpsAgent: new https.Agent({
-      keepAlive: false,
-      maxSockets: 32
-    })
+      keepAlive: performance.STORAGE_KEEP_ALIVE,
+      maxSockets: performance.STORAGE_MAX_SOCKETS,
+      maxFreeSockets: 8,
+      timeout: 20000,
+    }),
   }),
   // DigitalOcean Spaces rejects the CRC32 integrity headers newer AWS SDK
   // versions send by default. Do not remove.
   requestChecksumCalculation: "WHEN_REQUIRED",
   credentials: {
     accessKeyId: env.GARAGE_S3_ACCESS_KEY_ID,
-    secretAccessKey: env.GARAGE_S3_SECRET_ACCESS_KEY
-  }
+    secretAccessKey: env.GARAGE_S3_SECRET_ACCESS_KEY,
+  },
 });

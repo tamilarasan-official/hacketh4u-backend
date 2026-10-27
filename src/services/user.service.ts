@@ -1,17 +1,22 @@
 import { firestore } from "../config/firebase";
 import { HttpError } from "../utils/http-error";
 import { FieldValue } from "firebase-admin/firestore";
+import { cached, invalidateCache } from "./cache.service";
 
-export async function getUserProfile(userId: string): Promise<Record<string, unknown>> {
-  const doc = await firestore.collection("users").doc(userId).get();
-  if (!doc.exists) {
-    throw new HttpError(404, "User profile not found.");
-  }
+export async function getUserProfile(
+  userId: string,
+): Promise<Record<string, unknown>> {
+  return cached(`profile:${userId}`, 15, async () => {
+    const doc = await firestore.collection("users").doc(userId).get();
+    if (!doc.exists) {
+      throw new HttpError(404, "User profile not found.");
+    }
 
-  return {
-    id: doc.id,
-    ...doc.data()
-  };
+    return {
+      id: doc.id,
+      ...doc.data(),
+    };
+  });
 }
 
 export async function ensureUserProfile(input: {
@@ -21,15 +26,16 @@ export async function ensureUserProfile(input: {
   name: string;
   fcmToken?: string;
 }): Promise<{ userId: string; created: boolean }> {
+  await invalidateCache(`profile:${input.userId}`);
   const userRef = firestore.collection("users").doc(input.userId);
 
-  return firestore.runTransaction(async (transaction) => {
+  const result = await firestore.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(userRef);
     const current = snapshot.data() ?? {};
     const profile: Record<string, unknown> = {
       role: current.role ?? "user",
       isEnabled: current.isEnabled ?? true,
-      updatedAt: FieldValue.serverTimestamp()
+      updatedAt: FieldValue.serverTimestamp(),
     };
 
     if (typeof current.name !== "string" || !current.name.trim()) {
@@ -38,7 +44,10 @@ export async function ensureUserProfile(input: {
     if (typeof current.email !== "string" || !current.email.trim()) {
       profile.email = input.email ?? "";
     }
-    if (typeof current.phoneNumber !== "string" || !current.phoneNumber.trim()) {
+    if (
+      typeof current.phoneNumber !== "string" ||
+      !current.phoneNumber.trim()
+    ) {
       profile.phoneNumber = input.phoneNumber ?? "";
     }
     if (!snapshot.exists) {
@@ -52,4 +61,6 @@ export async function ensureUserProfile(input: {
     transaction.set(userRef, profile, { merge: true });
     return { userId: input.userId, created: !snapshot.exists };
   });
+  await invalidateCache(`profile:${input.userId}`);
+  return result;
 }

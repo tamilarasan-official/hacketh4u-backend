@@ -6,9 +6,10 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
-  UploadPartCommand
+  UploadPartCommand,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { createHash } from "node:crypto";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { Readable } from "node:stream";
 import { firestore } from "../config/firebase";
@@ -16,6 +17,13 @@ import { env } from "../config/env";
 import { garageS3, garageSigningRegion } from "../config/garage";
 import { HttpError } from "../utils/http-error";
 import { enqueueVideoProcessing } from "./job-queue.service";
+import {
+  buildPublicMediaUrl,
+  assertOwner,
+  validateObjectKey,
+  validateRange,
+} from "./media-url.service";
+import { performance } from "../config/performance";
 
 type UploadFolder =
   | "user-profiles"
@@ -47,6 +55,7 @@ type MultipartUploadInitInput = RequestUploadInput & {
 };
 
 type MultipartUploadPartInput = {
+  userId: string;
   objectKey: string;
   uploadId: string;
   partNumber: number;
@@ -68,55 +77,82 @@ type MultipartUploadCompleteInput = {
 };
 
 type MultipartUploadAbortInput = {
+  userId: string;
   objectKey: string;
   uploadId: string;
 };
 
-const GARAGE_READ_TIMEOUT_MS = 20_000;
+const GARAGE_READ_TIMEOUT_MS = performance.STORAGE_DEADLINE_MS;
 const GARAGE_READ_ATTEMPTS = 2;
 
-function shouldProcessVideo(folderOrObjectKey: string, contentType: string): boolean {
-  return folderOrObjectKey.startsWith("videos/raw") && contentType.toLowerCase().startsWith("video/");
+function shouldProcessVideo(
+  folderOrObjectKey: string,
+  contentType: string,
+): boolean {
+  return (
+    folderOrObjectKey.startsWith("videos/raw") &&
+    contentType.toLowerCase().startsWith("video/")
+  );
 }
 
 async function withGarageTimeout<T>(
   operation: string,
   objectKey: string,
-  run: (abortSignal: AbortSignal) => Promise<T>
+  run: (abortSignal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal,
 ): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= GARAGE_READ_ATTEMPTS; attempt += 1) {
     const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), GARAGE_READ_TIMEOUT_MS);
+    const timeout = setTimeout(
+      () => abortController.abort(),
+      GARAGE_READ_TIMEOUT_MS,
+    );
 
     try {
-      return await run(abortController.signal);
+      const signal = parentSignal
+        ? AbortSignal.any([parentSignal, abortController.signal])
+        : abortController.signal;
+      return await run(signal);
     } catch (error) {
       lastError = error;
+      if (parentSignal?.aborted)
+        throw new HttpError(499, "Client disconnected.");
       const message = error instanceof Error ? error.message : String(error);
       console.error("Garage media operation failed", {
         operation,
         objectKey,
         attempt,
-        message
+        message,
       });
 
-      const statusCode = (error as { $metadata?: { httpStatusCode?: number } }).$metadata
-        ?.httpStatusCode;
-      const retryable = abortController.signal.aborted ||
+      const statusCode = (error as { $metadata?: { httpStatusCode?: number } })
+        .$metadata?.httpStatusCode;
+      if (statusCode === 404) throw new HttpError(404, "Media not found.");
+      if (statusCode === 416)
+        throw new HttpError(416, "Range not satisfiable.");
+      if (statusCode === 403)
+        throw new HttpError(502, "Media storage access failed.");
+      const retryable =
+        abortController.signal.aborted ||
         statusCode == null ||
         statusCode >= 500 ||
-        /ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket|timeout/i.test(message);
+        /ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket|timeout/i.test(
+          message,
+        );
 
       if (!retryable || attempt === GARAGE_READ_ATTEMPTS) {
         if (abortController.signal.aborted) {
           throw new HttpError(504, "Media storage request timed out.", {
             operation,
-            objectKey
+            objectKey,
           });
         }
-        throw error;
+        throw new HttpError(
+          /timeout/i.test(message) ? 504 : 502,
+          "Media storage unavailable.",
+        );
       }
 
       await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
@@ -133,16 +169,6 @@ function buildObjectKey(input: RequestUploadInput): string {
   return `${input.folder}/${input.userId}/${Date.now()}_${safeFileName}`;
 }
 
-function buildPublicMediaUrl(objectKey: string): string {
-  const baseUrl = (env.APP_BASE_URL || "").replace(/\/$/, "");
-  if (baseUrl) {
-    return `${baseUrl}/media/public/${objectKey}`;
-  }
-  // The bucket is part of the public base URL (virtual-hosted addressing), so
-  // it must not be repeated in the path.
-  return `${env.GARAGE_S3_PUBLIC_BASE_URL.replace(/\/$/, "")}/${objectKey}`;
-}
-
 function buildHlsUrls(objectKey: string): {
   streamingUrl: string;
   qualities: Record<string, string>;
@@ -155,13 +181,15 @@ function buildHlsUrls(objectKey: string): {
     streamingUrl: buildPublicMediaUrl(`${hlsObjectPrefix}/master.m3u8`),
     qualities: {
       "720p": buildPublicMediaUrl(`${hlsObjectPrefix}/720p/index.m3u8`),
-      "480p": buildPublicMediaUrl(`${hlsObjectPrefix}/480p/index.m3u8`)
+      "480p": buildPublicMediaUrl(`${hlsObjectPrefix}/480p/index.m3u8`),
     },
-    hlsObjectPrefix
+    hlsObjectPrefix,
   };
 }
 
-export async function createSignedUpload(input: RequestUploadInput): Promise<Record<string, unknown>> {
+export async function createSignedUpload(
+  input: RequestUploadInput,
+): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
   }
@@ -171,23 +199,25 @@ export async function createSignedUpload(input: RequestUploadInput): Promise<Rec
   const command = new PutObjectCommand({
     Bucket: env.GARAGE_S3_BUCKET,
     Key: objectKey,
-    ContentType: input.contentType
+    ContentType: input.contentType,
   });
 
   const uploadUrl = await getSignedUrl(garageS3, command, {
     expiresIn: 900,
-    signingRegion: garageSigningRegion
+    signingRegion: garageSigningRegion,
   });
 
   return {
     bucket: env.GARAGE_S3_BUCKET,
     objectKey,
     uploadUrl,
-    publicUrl: buildPublicMediaUrl(objectKey)
+    publicUrl: buildPublicMediaUrl(objectKey),
   };
 }
 
-export async function uploadObjectDirect(input: DirectUploadInput): Promise<Record<string, unknown>> {
+export async function uploadObjectDirect(
+  input: DirectUploadInput,
+): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
   }
@@ -203,7 +233,7 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
     entityType: input.entityType,
     entityId: input.entityId,
     fileSize: input.fileSize ?? null,
-    contentType: input.contentType
+    contentType: input.contentType,
   });
 
   const upload = new Upload({
@@ -213,11 +243,11 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
       Key: objectKey,
       ContentType: input.contentType,
       Body: input.fileStream,
-      ...(input.fileSize != null ? { ContentLength: input.fileSize } : {})
+      ...(input.fileSize != null ? { ContentLength: input.fileSize } : {}),
     },
     queueSize: 1,
     partSize: 8 * 1024 * 1024,
-    leavePartsOnError: false
+    leavePartsOnError: false,
   });
 
   try {
@@ -227,7 +257,7 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
       objectKey,
       entityType: input.entityType,
       entityId: input.entityId,
-      message: error instanceof Error ? error.message : String(error)
+      message: error instanceof Error ? error.message : String(error),
     });
     throw error;
   }
@@ -235,7 +265,7 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
   console.info("Garage upload completed", {
     objectKey,
     entityType: input.entityType,
-    entityId: input.entityId
+    entityId: input.entityId,
   });
 
   const record = {
@@ -248,54 +278,14 @@ export async function uploadObjectDirect(input: DirectUploadInput): Promise<Reco
     status: "uploaded",
     storageProvider: "garage-s3",
     createdAt: new Date(),
-    updatedAt: new Date()
+    updatedAt: new Date(),
   };
 
-  const docRef = await firestore.collection("media_uploads").add(record);
-
-  if (shouldProcessVideo(input.folder, input.contentType)) {
-    try {
-      await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
-      const jobId = await enqueueVideoProcessing({
-        mediaId: docRef.id,
-        objectKey,
-        publicUrl,
-        contentType: input.contentType
-      });
-
-      return {
-        id: docRef.id,
-        objectKey,
-        publicUrl,
-        status: "processing",
-        jobId,
-        ...buildHlsUrls(objectKey)
-      };
-    } catch (error) {
-      console.error("Video HLS processing failed", {
-        objectKey,
-        message: error instanceof Error ? error.message : String(error)
-      });
-      await docRef.set(
-        {
-          status: "processing_failed",
-          processingError: error instanceof Error ? error.message : String(error),
-          updatedAt: new Date()
-        },
-        { merge: true }
-      );
-    }
-  }
-
-  return {
-    id: docRef.id,
-    objectKey,
-    publicUrl
-  };
+  return finishRecordedUpload(record);
 }
 
 export async function initiateMultipartUpload(
-  input: MultipartUploadInitInput
+  input: MultipartUploadInitInput,
 ): Promise<Record<string, unknown>> {
   if (!input.fileName.trim()) {
     throw new HttpError(400, "fileName is required.");
@@ -312,8 +302,8 @@ export async function initiateMultipartUpload(
     new CreateMultipartUploadCommand({
       Bucket: env.GARAGE_S3_BUCKET,
       Key: objectKey,
-      ContentType: input.contentType
-    })
+      ContentType: input.contentType,
+    }),
   );
 
   if (!result.UploadId) {
@@ -325,19 +315,20 @@ export async function initiateMultipartUpload(
     entityType: input.entityType,
     entityId: input.entityId,
     fileSize: input.fileSize ?? null,
-    contentType: input.contentType
+    contentType: input.contentType,
   });
 
   return {
     uploadId: result.UploadId,
     objectKey,
-    publicUrl
+    publicUrl,
   };
 }
 
 export async function uploadMultipartPart(
-  input: MultipartUploadPartInput
+  input: MultipartUploadPartInput,
 ): Promise<Record<string, unknown>> {
+  assertOwner(input.objectKey, input.userId);
   if (!input.objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -361,8 +352,8 @@ export async function uploadMultipartPart(
       UploadId: input.uploadId,
       PartNumber: input.partNumber,
       Body: input.body,
-      ContentLength: input.body.length
-    })
+      ContentLength: input.body.length,
+    }),
   );
 
   if (!result.ETag) {
@@ -371,13 +362,15 @@ export async function uploadMultipartPart(
 
   return {
     partNumber: input.partNumber,
-    eTag: result.ETag
+    eTag: result.ETag,
   };
 }
 
 export async function completeMultipartUpload(
-  input: MultipartUploadCompleteInput
+  input: MultipartUploadCompleteInput,
 ): Promise<Record<string, unknown>> {
+  assertOwner(input.objectKey, input.userId);
+  input.publicUrl = buildPublicMediaUrl(input.objectKey);
   if (!input.objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -394,7 +387,7 @@ export async function completeMultipartUpload(
     .sort((a, b) => a.partNumber - b.partNumber)
     .map((part) => ({
       ETag: part.eTag,
-      PartNumber: part.partNumber
+      PartNumber: part.partNumber,
     }));
 
   await garageS3.send(
@@ -403,16 +396,16 @@ export async function completeMultipartUpload(
       Key: input.objectKey,
       UploadId: input.uploadId,
       MultipartUpload: {
-        Parts: sortedParts
-      }
-    })
+        Parts: sortedParts,
+      },
+    }),
   );
 
   console.info("Garage multipart upload completed", {
     objectKey: input.objectKey,
     entityType: input.entityType,
     entityId: input.entityId,
-    parts: sortedParts.length
+    parts: sortedParts.length,
   });
 
   const record = {
@@ -425,53 +418,16 @@ export async function completeMultipartUpload(
     status: "uploaded",
     storageProvider: "garage-s3",
     createdAt: new Date(),
-    updatedAt: new Date()
+    updatedAt: new Date(),
   };
 
-  const docRef = await firestore.collection("media_uploads").add(record);
-
-  if (shouldProcessVideo(input.objectKey, input.contentType)) {
-    try {
-      await docRef.set({ status: "processing", updatedAt: new Date() }, { merge: true });
-      const jobId = await enqueueVideoProcessing({
-        mediaId: docRef.id,
-        objectKey: input.objectKey,
-        publicUrl: input.publicUrl,
-        contentType: input.contentType
-      });
-
-      return {
-        id: docRef.id,
-        objectKey: input.objectKey,
-        publicUrl: input.publicUrl,
-        status: "processing",
-        jobId,
-        ...buildHlsUrls(input.objectKey)
-      };
-    } catch (error) {
-      console.error("Video HLS processing failed", {
-        objectKey: input.objectKey,
-        message: error instanceof Error ? error.message : String(error)
-      });
-      await docRef.set(
-        {
-          status: "processing_failed",
-          processingError: error instanceof Error ? error.message : String(error),
-          updatedAt: new Date()
-        },
-        { merge: true }
-      );
-    }
-  }
-
-  return {
-    id: docRef.id,
-    objectKey: input.objectKey,
-    publicUrl: input.publicUrl
-  };
+  return finishRecordedUpload(record);
 }
 
-export async function abortMultipartUpload(input: MultipartUploadAbortInput): Promise<void> {
+export async function abortMultipartUpload(
+  input: MultipartUploadAbortInput,
+): Promise<void> {
+  assertOwner(input.objectKey, input.userId);
   if (!input.objectKey.trim() || !input.uploadId.trim()) {
     return;
   }
@@ -480,12 +436,18 @@ export async function abortMultipartUpload(input: MultipartUploadAbortInput): Pr
     new AbortMultipartUploadCommand({
       Bucket: env.GARAGE_S3_BUCKET,
       Key: input.objectKey,
-      UploadId: input.uploadId
-    })
+      UploadId: input.uploadId,
+    }),
   );
 }
 
-export async function getObject(objectKey: string, range?: string) {
+export async function getObject(
+  objectKey: string,
+  range?: string,
+  signal?: AbortSignal,
+) {
+  validateObjectKey(objectKey);
+  validateRange(range);
   if (!objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -498,14 +460,16 @@ export async function getObject(objectKey: string, range?: string) {
         new GetObjectCommand({
           Bucket: env.GARAGE_S3_BUCKET,
           Key: objectKey,
-          ...(range ? { Range: range } : {})
+          ...(range ? { Range: range } : {}),
         }),
-        { abortSignal }
-      )
+        { abortSignal },
+      ),
+    signal,
   );
 }
 
-export async function headObject(objectKey: string) {
+export async function headObject(objectKey: string, signal?: AbortSignal) {
+  validateObjectKey(objectKey);
   if (!objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -517,10 +481,11 @@ export async function headObject(objectKey: string) {
       garageS3.send(
         new HeadObjectCommand({
           Bucket: env.GARAGE_S3_BUCKET,
-          Key: objectKey
+          Key: objectKey,
         }),
-        { abortSignal }
-      )
+        { abortSignal },
+      ),
+    signal,
   );
 }
 
@@ -533,7 +498,13 @@ type CompleteUploadInput = {
   contentType: string;
 };
 
-export async function completeUpload(input: CompleteUploadInput): Promise<Record<string, unknown>> {
+export async function completeUpload(
+  input: CompleteUploadInput,
+): Promise<Record<string, unknown>> {
+  assertOwner(input.objectKey, input.userId);
+  const stored = await headObject(input.objectKey);
+  input.publicUrl = buildPublicMediaUrl(input.objectKey);
+  input.contentType = stored.ContentType ?? input.contentType;
   const record = {
     userId: input.userId,
     objectKey: input.objectKey,
@@ -544,14 +515,10 @@ export async function completeUpload(input: CompleteUploadInput): Promise<Record
     status: "uploaded",
     storageProvider: "garage-s3",
     createdAt: new Date(),
-    updatedAt: new Date()
+    updatedAt: new Date(),
   };
 
-  const docRef = await firestore.collection("media_uploads").add(record);
-  return {
-    id: docRef.id,
-    ...record
-  };
+  return finishRecordedUpload(record);
 }
 
 type DeleteUploadInput = {
@@ -559,7 +526,10 @@ type DeleteUploadInput = {
   objectKey: string;
 };
 
-export async function deleteObject(input: DeleteUploadInput): Promise<Record<string, unknown>> {
+export async function deleteObject(
+  input: DeleteUploadInput,
+): Promise<Record<string, unknown>> {
+  assertOwner(input.objectKey, input.userId);
   if (!input.objectKey.trim()) {
     throw new HttpError(400, "objectKey is required.");
   }
@@ -567,8 +537,8 @@ export async function deleteObject(input: DeleteUploadInput): Promise<Record<str
   await garageS3.send(
     new DeleteObjectCommand({
       Bucket: env.GARAGE_S3_BUCKET,
-      Key: input.objectKey
-    })
+      Key: input.objectKey,
+    }),
   );
 
   const snapshot = await firestore
@@ -582,14 +552,66 @@ export async function deleteObject(input: DeleteUploadInput): Promise<Record<str
       {
         status: "deleted",
         deletedBy: input.userId,
-        updatedAt: new Date()
+        updatedAt: new Date(),
       },
-      { merge: true }
+      { merge: true },
     );
   }
 
   return {
     deleted: true,
-    objectKey: input.objectKey
+    objectKey: input.objectKey,
+  };
+}
+
+async function recordUpload(record: Record<string, any>) {
+  const ref = firestore
+    .collection("media_uploads")
+    .doc(createHash("sha256").update(record.objectKey).digest("hex"));
+  const data = await firestore.runTransaction(async (tx) => {
+    const existing = await tx.get(ref);
+    if (existing.exists) return existing.data()!;
+    const video = shouldProcessVideo(record.objectKey, record.contentType);
+    const created: Record<string, any> = {
+      ...record,
+      status: video ? "queued" : "uploaded",
+    };
+    tx.create(ref, created);
+    if (video)
+      tx.create(firestore.collection("job_outbox").doc("video-" + ref.id), {
+        payload: {
+          mediaId: ref.id,
+          objectKey: record.objectKey,
+          publicUrl: record.publicUrl,
+          contentType: record.contentType,
+        },
+        status: "pending",
+        createdAt: new Date(),
+      });
+    return created;
+  });
+  return { ref, data };
+}
+
+async function finishRecordedUpload(record: Record<string, any>) {
+  const { ref, data } = await recordUpload(record);
+  const video = shouldProcessVideo(data.objectKey, data.contentType);
+  // Only the worker advances processing state. A repeated completion must not
+  // downgrade a processed record or replace its published playback metadata.
+  if (video && data.status === "queued") {
+    await enqueueVideoProcessing({
+      mediaId: ref.id,
+      objectKey: data.objectKey,
+      publicUrl: data.publicUrl,
+      contentType: data.contentType,
+    });
+  }
+  return {
+    ...(video ? buildHlsUrls(data.objectKey) : {}),
+    ...data,
+    id: ref.id,
+    // Preserve the existing asynchronous response contract for clients.
+    status: data.status === "queued" ? "processing" : data.status,
+    ...(video ? { jobId: `video-${ref.id}` } : {}),
   };
 }
