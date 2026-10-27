@@ -10,6 +10,7 @@ Production has not been deployed, restarted, load-tested again or mutated by thi
 - New clients request `limit=100` and follow `nextCursor` for entitlements. Legacy calls without pagination parameters retain complete responses. Remove the legacy unbounded path only after installed clients migrate.
 - Payments require a stable existing `paymentId`; current checkout already supplies this. Server pricing uses stored course prices, course-scoped percentage coupons and the app's existing proportional GST allocation. Client totals outside one paise are rejected with 409, not silently charged.
 - Merge the supplied Firestore index definitions into the project's authoritative index configuration. No indexes or rules have been deployed. Emulator tests do not prove production index availability.
+- Payment history needs both listed `userId`/`createdAt` indexes: legacy requests use descending document-ID ordering implicitly, while paginated requests explicitly use ascending document-ID ordering. Preserve the existing `paymentStatus` index as well; it serves a different query.
 
 ## Protected playback release gates
 
